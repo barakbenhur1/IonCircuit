@@ -10,13 +10,14 @@ import UIKit
 
 final class CarNode: SKNode {
     // ---- Tuning ----
-    var acceleration: CGFloat = 720.0      // was 560
-    var maxSpeed: CGFloat     = 1800.0     // was 900
+    var acceleration: CGFloat = 540.0      // was 560
+    var maxSpeed: CGFloat     = 1520.0     // was 900
     var reverseSpeedFactor: CGFloat = 0.55
-    var turnRate: CGFloat     = 5.0
+    var turnRate: CGFloat     = 4.2
     var traction: CGFloat     = 12.0
     var drag: CGFloat         = 1.0
     var brakeForce: CGFloat   = 1300.0
+    var speedCapBonus: CGFloat = 0   // forward-only extra cap, controlled by GameScene
     
     // Controls [-1, 1]
     var throttle: CGFloat = 0
@@ -196,7 +197,7 @@ final class CarNode: SKNode {
     
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     
-    // MARK: - Update (with yaw-rate clamp to kill oscillations)
+    // NOTE: requires: var speedCapBonus: CGFloat = 0 on CarNode
     func update(_ dt: CGFloat) {
         guard let pb = physicsBody else { return }
         
@@ -238,8 +239,9 @@ final class CarNode: SKNode {
             pb.applyForce(fwd.scaled(input * acceleration))
         }
         
-        // 4) Speed cap
-        let cap = (fwdMag >= 0 ? maxSpeed : maxSpeed * reverseSpeedFactor)
+        // 4) Speed cap (forward cap can be temporarily boosted by GameScene)
+        let capForward = maxSpeed + max(0, speedCapBonus)     // <-- boost applied here
+        let cap = (fwdMag >= 0 ? capForward : maxSpeed * reverseSpeedFactor)
         let speed = hypot(pb.velocity.dx, pb.velocity.dy)
         if speed > cap {
             let s = cap / max(speed, 0.001)
@@ -262,6 +264,7 @@ final class CarNode: SKNode {
         let newSpeed = hypot(pb.velocity.dx, pb.velocity.dy)
         updateExhaust(speed: newSpeed, fwdMag: fwdMag, dt: dt)
     }
+
     
     // MARK: - Exhaust helpers
     

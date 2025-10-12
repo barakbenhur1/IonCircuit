@@ -6,6 +6,7 @@
 //
 
 import SpriteKit
+import UIKit
 
 final class OpenWorldNode: SKNode {
     struct Config {
@@ -37,18 +38,21 @@ final class OpenWorldNode: SKNode {
         ground.strokeColor = .clear
         addChild(ground)
         
-        // ---- Motion grid (tiled) ----
+        // ---- Floor texture (tiled neon circuit) ----
         let cell: CGFloat = 80
         let line: CGFloat = 2
-        let tileGroup = makeGridTileGroup(cell: cell, line: line)
+        let tileGroup = makeCircuitTileGroup(cell: cell, line: line)
         let tileSet = SKTileSet(tileGroups: [tileGroup], tileSetType: .grid)
         
         let cols = Int(ceil(W / cell))
         let rows = Int(ceil(H / cell))
-        let map = SKTileMapNode(tileSet: tileSet, columns: cols, rows: rows, tileSize: CGSize(width: cell, height: cell))
+        let map = SKTileMapNode(tileSet: tileSet,
+                                columns: cols,
+                                rows: rows,
+                                tileSize: CGSize(width: cell, height: cell))
         for c in 0..<cols { for r in 0..<rows { map.setTileGroup(tileGroup, forColumn: c, row: r) } }
         map.zPosition = 0.5
-        map.alpha = 0.28
+        map.alpha = 0.30
         addChild(map)
         
         // Optional soft “hills” for depth
@@ -74,23 +78,86 @@ final class OpenWorldNode: SKNode {
         physicsBody = edge
     }
     
-    // Draw one transparent tile with a vertical + horizontal grid line.
-    // Repeats via SKTileMapNode so motion is obvious.
-    private func makeGridTileGroup(cell: CGFloat, line: CGFloat) -> SKTileGroup {
+    // MARK: - New floor: neon circuit tile (seamless)
+    private func makeCircuitTileGroup(cell: CGFloat, line: CGFloat) -> SKTileGroup {
         let size = CGSize(width: cell, height: cell)
-        let renderer = UIGraphicsImageRenderer(size: size)
-        let img = renderer.image { ctx in
+        let img = UIGraphicsImageRenderer(size: size).image { ctx in
+            // Transparent tile; blends over the dark ground
             UIColor.clear.setFill()
             ctx.fill(CGRect(origin: .zero, size: size))
             
-            let lineColor = UIColor(white: 1, alpha: 0.18)
-            ctx.cgContext.setStrokeColor(lineColor.cgColor)
-            ctx.cgContext.setLineWidth(line)
+            // Palette
+            let base = UIColor(hue: 0.55, saturation: 0.65, brightness: 0.75, alpha: 1) // cyan-ish
+            let glow = base.withAlphaComponent(0.22)
+            let stroke = base.withAlphaComponent(0.85)
+            let seam  = UIColor(white: 1, alpha: 0.06)
             
-            // vertical line at left
+            // --- Glow pads (two fixed positions so tiling stays consistent) ---
+            func drawPad(center: CGPoint, radius r: CGFloat) {
+                // soft radial "glow" behind a crisp ring
+                let colors = [glow.cgColor, UIColor.clear.cgColor] as CFArray
+                let locs: [CGFloat] = [0, 1]
+                let space = CGColorSpaceCreateDeviceRGB()
+                if let grad = CGGradient(colorsSpace: space, colors: colors, locations: locs) {
+                    ctx.cgContext.drawRadialGradient(
+                        grad,
+                        startCenter: center, startRadius: 0,
+                        endCenter: center, endRadius: r * 1.6,
+                        options: [.drawsAfterEndLocation]
+                    )
+                }
+                let ring = UIBezierPath(ovalIn: CGRect(x: center.x - r, y: center.y - r, width: r*2, height: r*2))
+                stroke.setStroke()
+                ring.lineWidth = 1.2
+                ring.stroke()
+            }
+            drawPad(center: CGPoint(x: size.width * 0.70, y: size.height * 0.72), radius: cell * 0.12)
+            drawPad(center: CGPoint(x: size.width * 0.28, y: size.height * 0.34), radius: cell * 0.09)
+            
+            // --- Traces (glow pass + crisp pass) ---
+            let y = size.height * 0.30
+            let x = size.width  * 0.38
+            
+            // glow pass
+            ctx.cgContext.setLineCap(.round)
+            ctx.cgContext.setStrokeColor(glow.cgColor)
+            ctx.cgContext.setLineWidth(line * 2.0)
+            // horizontal
+            ctx.cgContext.move(to: CGPoint(x: 0, y: y))
+            ctx.cgContext.addLine(to: CGPoint(x: size.width, y: y))
+            // vertical branch
+            ctx.cgContext.move(to: CGPoint(x: x, y: y))
+            ctx.cgContext.addLine(to: CGPoint(x: x, y: size.height))
+            ctx.cgContext.strokePath()
+            
+            // crisp pass
+            ctx.cgContext.setStrokeColor(stroke.cgColor)
+            ctx.cgContext.setLineWidth(1.4)
+            // horizontal
+            ctx.cgContext.move(to: CGPoint(x: 0, y: y))
+            ctx.cgContext.addLine(to: CGPoint(x: size.width, y: y))
+            // vertical
+            ctx.cgContext.move(to: CGPoint(x: x, y: y))
+            ctx.cgContext.addLine(to: CGPoint(x: x, y: size.height))
+            ctx.cgContext.strokePath()
+            
+            // vias (small dots) along the line
+            func via(_ p: CGPoint, r: CGFloat = 1.6) {
+                let rect = CGRect(x: p.x - r, y: p.y - r, width: r*2, height: r*2)
+                ctx.cgContext.setFillColor(stroke.withAlphaComponent(0.9).cgColor)
+                ctx.cgContext.fillEllipse(in: rect)
+            }
+            via(CGPoint(x: size.width * 0.15, y: y))
+            via(CGPoint(x: size.width * 0.52, y: y))
+            via(CGPoint(x: x, y: size.height * 0.58))
+            
+            // --- Tile seams (left & bottom) to guarantee seamless tiling ---
+            ctx.cgContext.setStrokeColor(seam.cgColor)
+            ctx.cgContext.setLineWidth(1)
+            // left seam
             ctx.cgContext.move(to: CGPoint(x: 0, y: 0))
             ctx.cgContext.addLine(to: CGPoint(x: 0, y: size.height))
-            // horizontal line at bottom
+            // bottom seam
             ctx.cgContext.move(to: CGPoint(x: 0, y: 0))
             ctx.cgContext.addLine(to: CGPoint(x: size.width, y: 0))
             ctx.cgContext.strokePath()
@@ -99,8 +166,7 @@ final class OpenWorldNode: SKNode {
         let tex = SKTexture(image: img)
         tex.filteringMode = .nearest
         let def = SKTileDefinition(texture: tex, size: size)
-        let group = SKTileGroup(tileDefinition: def)
-        return group
+        return SKTileGroup(tileDefinition: def)
     }
     
     // Remove any existing holes

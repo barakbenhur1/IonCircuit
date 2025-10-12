@@ -24,3 +24,11 @@ func smoothstep(_ edge0: CGFloat, _ edge1: CGFloat, _ x: CGFloat) -> CGFloat {
 // Tiny sign helper used in the steering code
 @inline(__always)
 func sign(_ v: CGFloat) -> CGFloat { v >= 0 ? 1 : -1 }
+
+private extension CGFloat {
+    static func random(in range: ClosedRange<CGFloat>) -> CGFloat {
+        let r = CGFloat(Double.random(in: Double(range.lowerBound)...Double(range.upperBound)))
+        return r
+    }
+}
+

@@ -9,6 +9,31 @@ import SpriteKit
 import UIKit
 
 final class GameScene: SKScene, SKPhysicsContactDelegate {
+    // MARK: - STREAMED Obstacles =================================================
+    
+    // Deterministic RNG per chunk/cell (SplitMix64)
+    private struct SplitMix64 {
+        private(set) var state: UInt64
+        init(seed: UInt64) { state = seed &+ 0x9E3779B97F4A7C15 }
+        mutating func next() -> UInt64 {
+            state &+= 0x9E3779B97F4A7C15
+            var z = state
+            z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
+            z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
+            return z ^ (z >> 31)
+        }
+        mutating func unit() -> CGFloat { CGFloat(Double(next()) / Double(UInt64.max)) }
+        mutating func range(_ r: ClosedRange<CGFloat>) -> CGFloat {
+            r.lowerBound + (r.upperBound - r.lowerBound) * unit()
+        }
+        mutating func chance(_ p: CGFloat) -> Bool { unit() < p }
+        mutating func int(_ r: ClosedRange<Int>) -> Int {
+            let u = Double(next()) / Double(UInt64.max)
+            let lo = r.lowerBound, hi = r.upperBound
+            return lo + Int(floor(u * Double(hi - lo + 1)))
+        }
+    }
+    
     // ==== World & Car ====
     private let car = CarNode()
     private var openWorld: OpenWorldNode?
@@ -46,9 +71,9 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     // ==== Speed HUD (km/h) ====
     private let speedHUD = SKNode()
     private let speedCard = SKShapeNode()
-    private let speedLabel = SKLabelNode(fontNamed: "Menlo")
-    private let unitLabel  = SKLabelNode(fontNamed: "Menlo")
-    private let speedBar   = SKShapeNode()
+    private let speedLabel  = SKLabelNode(fontNamed: "Menlo")
+    private let unitLabel   = SKLabelNode(fontNamed: "Menlo")
+    private let speedBar    = SKShapeNode()
     private var speedEMA: CGFloat = 0
     private let speedTau: CGFloat = 0.15
     private var lastHUDSample: TimeInterval = 0
@@ -76,29 +101,54 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     private let fireButton = SKNode()
     private let fireBase = SKShapeNode()
     private let fireIcon = SKShapeNode()
-
+    
     // Tap = singles; Hold = rapid
     private var lastManualShot: TimeInterval = 0
     private let singleTapCooldown: TimeInterval = 0.22   // tap spam limiter
     private let autoFireInterval: TimeInterval = 0.24    // hold rate (fast)
     private let autoFireArmDelay: TimeInterval = 0.18    // how long to hold before burst
-
+    
     private var driveTouch: UITouch?
     private var fireTouch: UITouch?
     private var firing = false
     private let autoFireKey = "autoFireLoop"
     private let autoArmKey  = "autoFireArm"
-
+    
     private let bulletSpeed: CGFloat = 2200
     private let bulletLife: TimeInterval = 1.0
-
+    
     // World bounds used to cull bullets
     private var worldBounds: CGRect = .zero
-
+    
+    // ==== Obstacle placement (blue-noise grid + patterns) ====
+    private let obstacleCell: CGFloat = 380          // was 280 → fewer anchors overall
+    private let obstacleEdgeMargin: CGFloat = 160    // a bit more margin from walls
+    private let obstacleKeepOutFromCar: CGFloat = 300
+    private let obstacleClearanceMajor: CGFloat = 80 // wider clearance from walls/ramps/etc
+    
+    // NEW: hard minimum spacing between *any* placed obstacles (cross-chunk)
+    private let minNeighborSpacing: CGFloat = 320
+    
+    // Cones slightly farther apart and fewer in a row
+    private let coneSpacing: CGFloat = 32
+    private let coneCountRange = 4...6
+    
+    // Rarer patterns
+    private let rampChance: CGFloat = 0.08           // was 0.12
+    private let coneRowChance: CGFloat = 0.16        // was 0.22
     
     // Spawn / walls
     private let spawnClearance: CGFloat = 80
     private let blockedMask: UInt32 = Category.wall
+    
+    // ==== Obstacle streaming (JIT spawn/despawn) ====
+    private let chunkSize: CGFloat = 2048        // spatial streaming chunk size
+    private let preloadMargin: CGFloat = 600     // spawn just outside the screen
+    private var loadedChunks: [Int64: [SKNode]] = [:]
+    private var lastStreamUpdateTime: TimeInterval = 0
+    private let streamUpdateInterval: TimeInterval = 0.12
+    private var worldSeed: UInt64 = 0            // deterministic layout across runs
+    private let obstacleRoot = SKNode()          // parent for streamed obstacles
     
     // MARK: - Scene lifecycle
     override func didMove(to view: SKView) {
@@ -108,13 +158,12 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         view.isMultipleTouchEnabled = true
         
         // World
-        // World
         let worldSize = CGSize(width: size.width * 100.0,
                                height: size.height * 100.0)
         let world = OpenWorldNode(config: .init(size: worldSize))
         addChild(world)
         openWorld = world
-
+        
         // Centered world: (-W/2,-H/2) .. (+W/2,+H/2)
         worldBounds = CGRect(x: -worldSize.width * 0.5,
                              y: -worldSize.height * 0.5,
@@ -126,6 +175,12 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         car.position = safeSpawnPoint(in: searchRect, radius: spawnClearance)
         car.zRotation = 0
         addChild(car)
+        
+        // --- STREAMED obstacles (NOT all at once) ---
+        worldSeed = UInt64.random(in: 1...UInt64.max)
+        obstacleRoot.zPosition = 1
+        addChild(obstacleRoot)
+        refreshObstacleStreaming(force: true)   // initial load
         
         // Camera (locks to car)
         let cam = SKCameraNode()
@@ -400,7 +455,6 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     }
     
     private func makeNeedlePath(length: CGFloat, width: CGFloat, tipRadius: CGFloat) -> CGPath {
-        // Triangle pointing up (+Y)
         let half = width * 0.5
         let tip = CGPoint(x: 0, y: length)
         let left = CGPoint(x: -half, y: 0)
@@ -437,20 +491,16 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     }
     
     private func updateSpeedHUD(kmh: CGFloat) {
-        // own clock (independent of scene dt)
         let now = CACurrentMediaTime()
         let dt  = lastHUDSample == 0 ? 1.0/60.0 : max(1e-3, now - lastHUDSample)
         lastHUDSample = now
         
-        // EMA smoothing
         let alpha = 1 - exp(-dt / Double(max(0.001, speedTau)))   // 0..1
         speedEMA += (kmh - speedEMA) * CGFloat(alpha)
         
-        // clamp & show number
         let shown = max(0, speedEMA)
         speedLabel.text = String(format: "%3.0f", shown)
         
-        // progress geometry (never invalid)
         let maxW: CGFloat = max(1, speedCard.frame.width - 24)
         let frac = min(1, max(0, shown / max(kmhMaxShown, 1)))
         var w = maxW * frac
@@ -476,24 +526,26 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         return x
     }
     
+    private func shortestAngle(from: CGFloat, to: CGFloat) -> CGFloat {
+        var d = (to - from).truncatingRemainder(dividingBy: .pi * 2)
+        if d >= .pi { d -= .pi * 2 }
+        if d <= -.pi { d += .pi * 2 }
+        return d
+    }
+    
     private func updateHeadingHUD(desired angDesired: CGFloat, actual angActual: CGFloat) {
-        // Rotate needles so 0 rad = North (+Y on screen) to match the dial labels.
-        // atan2 gives 0 at +X → subtract π/2.
         let desiredRot = normalizeAngle(angDesired - .pi/2)
         let actualRot  = normalizeAngle(angActual  - .pi/2)
         
-        // Color + brightness
         let color: UIColor = (activeBand >= 0 && activeBand < ringPalette.count)
         ? ringPalette[activeBand]
         : UIColor.systemTeal
         headingNeedleTarget.fillColor = color.withAlphaComponent(isTouching ? 0.95 : 0.75)
         headingNeedleActual.fillColor = UIColor.white.withAlphaComponent(0.85)
         
-        // Apply rotations
         headingNeedleTarget.zRotation = desiredRot
         headingNeedleActual.zRotation = actualRot
         
-        // Subtle breathing when touching
         if isTouching && headingHUD.action(forKey: "pulse") == nil {
             let up = SKAction.fadeAlpha(to: 1.0, duration: 0.15)
             let down = SKAction.fadeAlpha(to: 0.82, duration: 0.35)
@@ -510,6 +562,52 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         return car.position.distance(to: pScene) <= 26
     }
     
+    // MARK: - SKPhysicsContactDelegate
+    func didBegin(_ contact: SKPhysicsContact) {
+        // Normalize order for convenience
+        let bodyA = contact.bodyA
+        let bodyB = contact.bodyB
+        
+        @inline(__always) func isBullet(_ b: SKPhysicsBody) -> Bool {
+            (b.categoryBitMask & Category.bullet) != 0
+        }
+        @inline(__always) func isObstacle(_ b: SKPhysicsBody) -> Bool {
+            (b.categoryBitMask & Category.obstacle) != 0
+        }
+        @inline(__always) func isWall(_ b: SKPhysicsBody) -> Bool {
+            (b.categoryBitMask & Category.wall) != 0
+        }
+        @inline(__always) func killBullet(_ b: SKPhysicsBody) {
+            b.node?.removeAllActions()
+            b.node?.removeFromParent()
+        }
+        
+        // ------ Bullet ↔ Obstacle ------
+        if (isBullet(bodyA) && isObstacle(bodyB)) || (isBullet(bodyB) && isObstacle(bodyA)) {
+            let bullet   = isBullet(bodyA) ? bodyA : bodyB
+            let obstacle = isObstacle(bodyA) ? bodyA : bodyB
+            
+            if let ob = obstacle.node as? ObstacleNode {
+                // Convert hit point to obstacle's local space for nicer FX placement
+                let hitScene = contact.contactPoint
+                let hitLocal = ob.convert(hitScene, from: self)
+                ob.applyDamage(1, impact: hitLocal)   // handles steel (no HP loss + pulse) internally
+            }
+            // Remove the bullet on any obstacle hit
+            killBullet(bullet)
+            return
+        }
+        
+        // ------ Bullet ↔ Wall ------
+        if (isBullet(bodyA) && isWall(bodyB)) || (isBullet(bodyB) && isWall(bodyA)) {
+            let bullet = isBullet(bodyA) ? bodyA : bodyB
+            killBullet(bullet)
+            return
+        }
+        
+        // Add other contact pairs as needed...
+    }
+    
     // MARK: - Touches
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let cam = camera else { return }
@@ -517,7 +615,6 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         for t in touches {
             let pCam = t.location(in: cam)
             
-            // --- Fire button (start auto-fire; do not block driving) ---
             // --- Fire button (start auto-fire; do not block driving) ---
             if fireTouch == nil, pointInsideFireButton(pCam) {
                 fireTouch = t
@@ -534,7 +631,6 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
                     controlArmed = true
                     isCoasting = false
                     
-                    // anchor at center; seed angle = current heading (no jump)
                     fingerCam = .zero
                     hasAngleLP = true
                     angleLP = car.zRotation + .pi/2
@@ -685,7 +781,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         fireButton.run(.sequence([down, up]), withKey: "press")
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }
-
+    
     @discardableResult
     private func spawnBullet() -> SKNode {
         // From car nose, along its forward (+Y in car space)
@@ -694,12 +790,12 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         let muzzleOffset: CGFloat = 26
         let origin = CGPoint(x: car.position.x + fwd.dx * muzzleOffset,
                              y: car.position.y + fwd.dy * muzzleOffset)
-
+        
         // Bullet velocity = car velocity + projectile speed
         let carVel = car.physicsBody?.velocity ?? .zero
         let vel = CGVector(dx: carVel.dx + fwd.dx * bulletSpeed,
                            dy: carVel.dy + fwd.dy * bulletSpeed)
-
+        
         let bullet = SKShapeNode(circleOfRadius: 3.5)
         bullet.name = "bullet"
         bullet.fillColor = .white
@@ -707,22 +803,27 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         bullet.lineWidth = 0.8
         bullet.glowWidth = 2.0
         bullet.position = origin
-
+        
         let pb = SKPhysicsBody(circleOfRadius: 3.5)
+        pb.isDynamic = true
         pb.affectedByGravity = false
         pb.allowsRotation = false
         pb.linearDamping = 0
         pb.friction = 0
-        pb.collisionBitMask = 0
-        pb.contactTestBitMask = 0
+        
+        pb.categoryBitMask = Category.bullet
+        pb.contactTestBitMask = Category.obstacle       // notify when touching obstacles
+        pb.collisionBitMask = Category.obstacle         // <— allow collision so contact is guaranteed
+        pb.usesPreciseCollisionDetection = true         // <— prevents tunneling at high speed
+        
         pb.velocity = vel
         bullet.physicsBody = pb
-
+        
         addChild(bullet)
         bullet.run(.sequence([.wait(forDuration: bulletLife), .removeFromParent()]))
         return bullet
     }
-
+    
     private func fireOnceManual() {
         let now = CACurrentMediaTime()
         if now - lastManualShot < singleTapCooldown { return }
@@ -734,10 +835,10 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     private func startAutoFire() {
         guard !firing else { return }
         firing = true
-
+        
         // Single shot immediately on press
         fireOnceManual()
-
+        
         // Arm burst only if held beyond the delay
         removeAction(forKey: autoArmKey)
         let arm = SKAction.sequence([
@@ -754,12 +855,431 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         ])
         run(arm, withKey: autoArmKey)
     }
-
+    
     private func stopAutoFire() {
         firing = false
         removeAction(forKey: autoArmKey)
         removeAction(forKey: autoFireKey)
     }
+    
+    private func hash2(_ x: Int, _ y: Int, seed: UInt64) -> UInt64 {
+        var h = seed &+ UInt64(bitPattern: Int64(x)) &* 0x9E3779B97F4A7C15
+        h ^= UInt64(bitPattern: Int64(y)) &* 0xBF58476D1CE4E5B9
+        h ^= (h >> 27)
+        return h
+    }
+    
+    private func cameraWorldRect(margin: CGFloat) -> CGRect {
+        let camPos = camera?.position ?? .zero
+        return CGRect(x: camPos.x - size.width/2  - margin,
+                      y: camPos.y - size.height/2 - margin,
+                      width:  size.width  + margin * 2,
+                      height: size.height + margin * 2)
+    }
+    
+    private func chunkRange(for rect: CGRect) -> (cx0: Int, cx1: Int, cy0: Int, cy1: Int) {
+        func toCX(_ x: CGFloat) -> Int { Int(floor((x - worldBounds.minX) / chunkSize)) }
+        func toCY(_ y: CGFloat) -> Int { Int(floor((y - worldBounds.minY) / chunkSize)) }
+        let cx0 = toCX(rect.minX), cx1 = toCX(rect.maxX)
+        let cy0 = toCY(rect.minY), cy1 = toCY(rect.maxY)
+        return (min(cx0,cx1), max(cx0,cx1), min(cy0,cy1), max(cy0,cy1))
+    }
+    
+    private func chunkRect(cx: Int, cy: Int) -> CGRect {
+        CGRect(x: worldBounds.minX + CGFloat(cx) * chunkSize,
+               y: worldBounds.minY + CGFloat(cy) * chunkSize,
+               width: chunkSize, height: chunkSize)
+    }
+    
+    private func chunkKey(cx: Int, cy: Int) -> Int64 {
+        (Int64(cx) << 32) ^ Int64(cy & 0xFFFF_FFFF)
+    }
+    
+    private func maybeUpdateObstacleStreaming(_ now: TimeInterval) {
+        if now - lastStreamUpdateTime < streamUpdateInterval { return }
+        lastStreamUpdateTime = now
+        refreshObstacleStreaming(force: false)
+    }
+    
+    private func refreshObstacleStreaming(force: Bool) {
+        let target = cameraWorldRect(margin: preloadMargin)
+        let r = chunkRange(for: target)
+        
+        var want: Set<Int64> = []
+        for cy in r.cy0...r.cy1 {
+            for cx in r.cx0...r.cx1 {
+                let key = chunkKey(cx: cx, cy: cy)
+                want.insert(key)
+                if loadedChunks[key] == nil || force {
+                    spawnChunk(cx: cx, cy: cy)
+                }
+            }
+        }
+        
+        // Despawn far-away chunks
+        if !force {
+            for (key, nodes) in loadedChunks where !want.contains(key) {
+                for n in nodes { n.removeAllActions(); n.removeFromParent() }
+                loadedChunks.removeValue(forKey: key)
+            }
+        }
+    }
+    
+    private func spawnChunk(cx: Int, cy: Int) {
+        let key = chunkKey(cx: cx, cy: cy)
+        guard loadedChunks[key] == nil else { return }
+        let rect = chunkRect(cx: cx, cy: cy)
+        
+        var nodes: [SKNode] = []
+        spawnObstacles(in: rect, nodesOut: &nodes, cx: cx, cy: cy)
+        loadedChunks[key] = nodes
+    }
+    
+    // Lower density, better spacing, deterministic per chunk
+    // Lower density, better spacing, deterministic per chunk,
+    // with steel (indestructible), barrier (replaces ramp),
+    // and per-cone spacing checks.
+    private func spawnObstacles(in rect: CGRect, nodesOut: inout [SKNode], cx: Int, cy: Int) {
+        // Tunables local to this function (safe defaults)
+        let barrierChance: CGFloat = 0.10         // rarity of barrier patterns
+        let coneRowChanceLocal: CGFloat = 0.16    // rarity of cone rows
+        let steelChanceSingle: CGFloat = 0.15     // chance for steel in single-scatter
+        
+        // Anchor sampling parameters
+        let pad: CGFloat = max(28, obstacleCell * 0.08)   // keep anchors off cell edges
+        let cols = Int(ceil(rect.width / obstacleCell))
+        let rows = Int(ceil(rect.height / obstacleCell))
+        
+        let worldCenter = CGPoint(x: worldBounds.midX, y: worldBounds.midY)
+        
+        for j in 0..<rows {
+            for i in 0..<cols {
+                // Deterministic RNG for this anchor
+                var rng = SplitMix64(seed: hash2(cx*10_000 + i, cy*10_000 + j, seed: worldSeed))
+                
+                // Cell rect and jittered anchor
+                let cellRect = CGRect(
+                    x: rect.minX + CGFloat(i) * obstacleCell,
+                    y: rect.minY + CGFloat(j) * obstacleCell,
+                    width: obstacleCell, height: obstacleCell
+                )
+                let jitterX = rng.range(pad...(obstacleCell - pad))
+                let jitterY = rng.range(pad...(obstacleCell - pad))
+                let a = CGPoint(x: cellRect.minX + jitterX, y: cellRect.minY + jitterY)
+                
+                // Bounds & spawn keep-outs
+                if !worldBounds.insetBy(dx: obstacleEdgeMargin, dy: obstacleEdgeMargin).contains(a) { continue }
+                if a.distance(to: car.position) < obstacleKeepOutFromCar { continue }
+                
+                // Density shaping: fewer near center, more at outskirts (overall reduced)
+                let toCenter = hypot(a.x - worldCenter.x, a.y - worldCenter.y)
+                let maxR = 0.5 * hypot(worldBounds.width, worldBounds.height)
+                let falloff = CGFloat.clamp(toCenter / max(1, maxR), 0, 1)   // 0 center .. 1 edge
+                let placeP: CGFloat = 0.14 + 0.28 * falloff                  // reduced from earlier
+                if !rng.chance(placeP) { continue }
+                
+                // Global Poisson-like spacing (cross-chunk)
+                if hasNeighborObstacle(near: a, radius: minNeighborSpacing) { continue }
+                
+                // Clearance from existing walls/obstacles/holes/car
+                let avoidMask: UInt32 = Category.wall | Category.obstacle | Category.hole | Category.car
+                if !clearanceOK(at: a, radius: obstacleClearanceMajor, mask: avoidMask) { continue }
+                
+                // Decide & place a pattern
+                var placedSomething = false
+                var placedNodes: [SKNode] = []
+                
+                // --- BARRIER (rare), oriented away from center ---
+                if rng.chance(barrierChance) {
+                    let dir = CGVector(dx: a.x - worldCenter.x, dy: a.y - worldCenter.y)
+                    let rot = atan2(dir.dy, dir.dx)
+                    
+                    if !hasNeighborObstacle(near: a, radius: minNeighborSpacing),
+                       let barrier = placeObstacleTracked(.barrier, at: a, rotation: rot) {
+                        placedSomething = true
+                        placedNodes.append(barrier)
+                        
+                        // Optional cones guarding the barrier entry (also spaced-checked)
+                        let back = CGPoint(x: a.x - cos(rot) * 56, y: a.y - sin(rot) * 56)
+                        let left = CGPoint(x: back.x - sin(rot) * 16, y: back.y + cos(rot) * 16)
+                        let right = CGPoint(x: back.x + sin(rot) * 16, y: back.y - cos(rot) * 16)
+                        
+                        if !hasNeighborObstacle(near: left, radius: minNeighborSpacing),
+                           let l = placeObstacleTracked(.cone, at: left, rotation: rot) { placedNodes.append(l) }
+                        if !hasNeighborObstacle(near: right, radius: minNeighborSpacing),
+                           let r = placeObstacleTracked(.cone, at: right, rotation: rot) { placedNodes.append(r) }
+                    }
+                }
+                
+                // --- CONE ROW (lane marking) with per-cone spacing enforcement ---
+                if !placedSomething, rng.chance(coneRowChanceLocal) {
+                    let baseRot: CGFloat = (rng.chance(0.5) ? 0 : .pi/2)
+                    let rot = baseRot + (.pi/12) * (rng.range(-1...1))
+                    let count = rng.int(coneCountRange)
+                    
+                    var ok = true
+                    var rowNodes: [SKNode] = []
+                    for idx in 0..<count {
+                        let t = CGFloat(idx) - CGFloat(count - 1) * 0.5
+                        let p = CGPoint(
+                            x: a.x + cos(rot) * coneSpacing * t,
+                            y: a.y + sin(rot) * coneSpacing * t
+                        )
+                        
+                        // Prevent bunching inside row and against neighbors
+                        if hasNeighborObstacle(near: p, radius: minNeighborSpacing) { ok = false; break }
+                        
+                        if let n = placeObstacleTracked(.cone, at: p, rotation: rot) {
+                            rowNodes.append(n)
+                        } else {
+                            ok = false; break
+                        }
+                    }
+                    
+                    if ok {
+                        placedSomething = true
+                        placedNodes.append(contentsOf: rowNodes)
+                    } else {
+                        // rollback partial row
+                        rowNodes.forEach { $0.removeFromParent() }
+                    }
+                }
+                
+                // --- SINGLE SCATTER (rock / barrel / steel) ---
+                if !placedSomething {
+                    // 15% steel (indestructible), otherwise rock vs barrel
+                    let u = rng.unit()
+                    let kind: ObstacleKind
+                    if u < steelChanceSingle { kind = .steel }
+                    else if u < 0.60 { kind = .rock }
+                    else { kind = .barrel }
+                    
+                    let rot = rng.range(-(.pi/8)...(.pi/8))
+                    if !hasNeighborObstacle(near: a, radius: minNeighborSpacing),
+                       let n = placeObstacleTracked(kind, at: a, rotation: rot) {
+                        placedSomething = true
+                        placedNodes.append(n)
+                    }
+                }
+                
+                if placedSomething {
+                    nodesOut.append(contentsOf: placedNodes)
+                }
+            }
+        }
+    }
+    
+    // MARK: - Existing placement utilities (tweaked to support tracking)
+    
+    private func clearanceOK(at p: CGPoint, radius: CGFloat, mask: UInt32) -> Bool {
+        var blocked = false
+        let r = CGRect(x: p.x - radius, y: p.y - radius, width: radius*2, height: radius*2)
+        physicsWorld.enumerateBodies(in: r) { body, stop in
+            if (body.categoryBitMask & mask) != 0 {
+                blocked = true; stop.pointee = true
+            }
+        }
+        return !blocked
+    }
+    
+    /// Tracked variant returns the created node (so we can despawn per chunk).
+    @discardableResult
+    private func placeObstacleTracked(_ kind: ObstacleKind, at p: CGPoint, rotation: CGFloat = 0) -> SKNode? {
+        // Don’t place outside world or too close to edges
+        if !worldBounds.insetBy(dx: obstacleEdgeMargin, dy: obstacleEdgeMargin).contains(p) { return nil }
+        
+        // Clearance from existing walls/obstacles/holes/ramps/car
+        let avoidMask: UInt32 = Category.wall | Category.obstacle | Category.hole | Category.ramp | Category.car
+        if !clearanceOK(at: p, radius: obstacleClearanceMajor, mask: avoidMask) { return nil }
+        
+        let node = ObstacleFactory.make(kind)
+        node.position = p
+        node.zRotation = rotation
+        node.zPosition = 1
+        obstacleRoot.addChild(node)   // important: parent under obstacleRoot
+        return node
+    }
+    
+    /// Backward-compatible wrapper (if you use it elsewhere)
+    @discardableResult
+    private func placeObstacle(_ kind: ObstacleKind, at p: CGPoint, rotation: CGFloat = 0) -> Bool {
+        return placeObstacleTracked(kind, at: p, rotation: rotation) != nil
+    }
+    
+    // Are there already obstacles too close? (uses physics bodies so it's fast enough per spawn)
+    private func hasNeighborObstacle(near p: CGPoint, radius: CGFloat) -> Bool {
+        var found = false
+        let r = CGRect(x: p.x - radius, y: p.y - radius, width: radius*2, height: radius*2)
+        let mask: UInt32 = Category.obstacle | Category.ramp | Category.hole
+        physicsWorld.enumerateBodies(in: r) { body, stop in
+            if (body.categoryBitMask & mask) != 0,
+               let n = body.node {
+                // If your ObstacleFactory parents under obstacleRoot (recommended), this avoids false positives.
+                // If not, you can drop the parent check.
+                if let _ = n.parent, n.position.distance(to: p) < radius {
+                    found = true; stop.pointee = true
+                }
+            }
+        }
+        return found
+    }
+    
+    // MARK: - Destruction FX
+    func spawnDestructionFX(at p: CGPoint, for kind: ObstacleKind) {
+        // ---- palette per obstacle type ----
+        let debrisColors: [UIColor]
+        switch kind {
+        case .cone:    debrisColors = [UIColor.orange, UIColor(red: 1, green: 0.65, blue: 0.2, alpha: 1), .white]
+        case .barrel:  debrisColors = [UIColor.brown, UIColor(red: 0.35, green: 0.18, blue: 0.08, alpha: 1), .white]
+        case .rock:    debrisColors = [UIColor(white: 0.85, alpha: 1), UIColor(white: 0.55, alpha: 1), UIColor(white: 0.35, alpha: 1)]
+        case .barrier: debrisColors = [UIColor(white: 0.85, alpha: 1), UIColor(white: 0.7, alpha: 1), UIColor(white: 0.4, alpha: 1)]
+        case .steel:   debrisColors = [UIColor(white: 0.9, alpha: 1), UIColor(white: 0.6, alpha: 1)] // shouldn't blow up, but safe
+        }
+        
+        // ---- 1) shockwave ring ----
+        let ringR: CGFloat = 6
+        let ring = SKShapeNode(circleOfRadius: ringR)
+        ring.position = p
+        ring.strokeColor = UIColor.white.withAlphaComponent(0.8)
+        ring.lineWidth = 3
+        ring.fillColor = .clear
+        ring.zPosition = 50
+        addChild(ring)
+        let ringAnim = SKAction.group([
+            .scale(to: 8.0, duration: 0.35),
+            .fadeOut(withDuration: 0.35)
+        ])
+        ring.run(.sequence([ringAnim, .removeFromParent()]))
+        
+        // ---- 2) spark burst (fast, bright) ----
+        let spark = SKEmitterNode()
+        spark.particleTexture = makeRoundTex(px: 10)
+        spark.particleBirthRate = 0
+        spark.numParticlesToEmit = 120
+        spark.particleLifetime = 0.45
+        spark.particleLifetimeRange = 0.15
+        spark.particleSpeed = 460
+        spark.particleSpeedRange = 240
+        spark.emissionAngleRange = .pi * 2
+        spark.particleAlpha = 0.95
+        spark.particleAlphaSpeed = -2.4
+        spark.particleScale = 0.28
+        spark.particleScaleRange = 0.18
+        spark.particleBlendMode = .add
+        spark.particleColorSequence = SKKeyframeSequence(
+            keyframeValues: [debrisColors.first ?? .white,
+                             (debrisColors.dropFirst().first ?? .white).withAlphaComponent(0.9),
+                             UIColor.white.withAlphaComponent(0.0)],
+            times: [0.0, 0.55, 1.0]
+        )
+        spark.position = p
+        spark.zPosition = 49
+        addChild(spark)
+        // one-shot burst
+        spark.particleBirthRate = 4000
+        spark.run(.sequence([
+            .wait(forDuration: 0.05),
+            .run { spark.particleBirthRate = 0 },
+            .wait(forDuration: 0.7),
+            .removeFromParent()
+        ]))
+        
+        // ---- 3) dust/smoke puff (soft, lingers) ----
+        let smoke = SKEmitterNode()
+        smoke.particleTexture = makeRoundTex(px: 20)
+        smoke.numParticlesToEmit = 28
+        smoke.particleLifetime = 0.9
+        smoke.particleLifetimeRange = 0.2
+        smoke.particleSpeed = 90
+        smoke.particleSpeedRange = 60
+        smoke.emissionAngleRange = .pi * 2
+        smoke.particleAlpha = 0.35
+        smoke.particleAlphaSpeed = -0.35
+        smoke.particleScale = 0.55
+        smoke.particleScaleSpeed = 0.45
+        smoke.particleColor = UIColor(white: 0.6, alpha: 1)
+        smoke.particleBlendMode = .alpha
+        smoke.position = p
+        smoke.zPosition = 48
+        addChild(smoke)
+        smoke.run(.sequence([.wait(forDuration: 1.2), .removeFromParent()]))
+        
+        // ---- 4) a few chunky debris sprites that arc out ----
+        for _ in 0..<8 {
+            let s = SKSpriteNode(texture: makeRectTex(size: CGSize(width: .random(in: 3...6),
+                                                                   height: .random(in: 6...12))))
+            s.colorBlendFactor = 1
+            s.color = debrisColors.randomElement() ?? .white
+            s.position = p
+            s.zPosition = 51
+            addChild(s)
+            
+            let angle = CGFloat.random(in: 0 ..< .pi * 2)
+            let speed = CGFloat.random(in: 220...420)
+            let dx = cos(angle) * speed
+            let dy = sin(angle) * speed
+            
+            let move = SKAction.moveBy(x: dx * 0.25, y: dy * 0.25, duration: 0.25)
+            move.timingMode = .easeOut
+            let drift = SKAction.moveBy(x: dx * 0.15, y: dy * 0.15, duration: 0.35)
+            drift.timingMode = .easeIn
+            let spin = SKAction.rotate(byAngle: CGFloat.random(in: -2...2), duration: 0.6)
+            let fade = SKAction.fadeOut(withDuration: 0.6)
+            s.run(.sequence([.group([.sequence([move, drift]), spin, fade]), .removeFromParent()]))
+        }
+        
+        // ---- 5) small camera shake ----
+        shakeCamera(intensity: 6, duration: 0.20)
+    }
+    
+    // Tiny radial dot texture (for sparks/smoke)
+    private func makeRoundTex(px: CGFloat) -> SKTexture {
+        let size = CGSize(width: px, height: px)
+        let img = UIGraphicsImageRenderer(size: size).image { ctx in
+            let cg = ctx.cgContext
+            let colors = [UIColor.white.cgColor,
+                          UIColor(white: 1, alpha: 0).cgColor] as CFArray
+            let grad = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
+                                  colors: colors, locations: [0, 1])!
+            cg.drawRadialGradient(
+                grad,
+                startCenter: CGPoint(x: px/2, y: px/2), startRadius: 0,
+                endCenter: CGPoint(x: px/2, y: px/2), endRadius: px/2,
+                options: .drawsBeforeStartLocation
+            )
+        }
+        let t = SKTexture(image: img)
+        t.filteringMode = .linear
+        return t
+    }
+    
+    // Small rectangle texture (for chunky debris)
+    private func makeRectTex(size: CGSize) -> SKTexture {
+        let img = UIGraphicsImageRenderer(size: size).image { ctx in
+            UIColor.white.setFill()
+            ctx.fill(CGRect(origin: .zero, size: size))
+        }
+        let t = SKTexture(image: img)
+        t.filteringMode = .nearest
+        return t
+    }
+    
+    // Lightweight camera shake
+    private func shakeCamera(intensity: CGFloat, duration: TimeInterval) {
+        guard let cam = camera else { return }
+        cam.removeAction(forKey: "shake")
+        let frames = max(2, Int(ceil(duration / 0.02)))
+        var seq: [SKAction] = []
+        for _ in 0..<frames {
+            let dx = CGFloat.random(in: -intensity...intensity)
+            let dy = CGFloat.random(in: -intensity...intensity)
+            seq.append(.moveBy(x: dx, y: dy, duration: 0.02))
+        }
+        seq.append(.moveTo(x: car.position.x, duration: 0.02))
+        seq.append(.moveTo(y: car.position.y, duration: 0.00))
+        cam.run(.sequence(seq), withKey: "shake")
+    }
+    
     
     // MARK: - Update
     override func update(_ currentTime: TimeInterval) {
@@ -767,10 +1287,17 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         let raw = (lastUpdate == 0) ? 0 : (currentTime - lastUpdate)
         lastUpdate = currentTime
         let dt = CGFloat(min(max(raw, 0), 0.05))
-        guard dt > 0 else { return }
+        guard dt > 0 else {
+            // keep camera glued even on first frame
+            camera?.position = car.position
+            return
+        }
         
         // Keep camera centered on car
         camera?.position = car.position
+        
+        // Stream obstacles near the camera view
+        maybeUpdateObstacleStreaming(currentTime)
         
         // ---------- finger → heading/throttle ----------
         if isTouching, controlArmed, let f = fingerCam, let pb = car.physicsBody {
@@ -795,13 +1322,6 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
                 }
             }
             
-            // radius → normalized target speed (0..1)
-            let tNorm = (dClamped <= innerR + 1)
-            ? 0
-            : (dClamped - innerR) / max(outerR - innerR, 1)
-            let targetNorm  = CGFloat.clamp(tNorm, 0, 1)
-            let targetSpeed = targetNorm * car.maxSpeed
-            
             // Steering: freeze while in deadzone; otherwise steer toward angleLP
             let heading  = car.zRotation + .pi/2
             let angleErr = shortestAngle(from: heading, to: angleLP)
@@ -813,14 +1333,32 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
                 car.steer  = tanh(2.1 * steerP)
             }
             
-            // ---- THROTTLE ----
+            // ---- THROTTLE & BOOST ----
             let fwd = CGVector(dx: cos(heading), dy: sin(heading))
             let v   = pb.velocity
             let fwdMag = v.dx * fwd.dx + v.dy * fwd.dy
             
+            // Base mapping (edge of ring = maxSpeed)
+            let tNormBase = (dClamped <= innerR + 1)
+            ? 0
+            : (dClamped - innerR) / max(outerR - innerR, 1)
+            let tNorm = CGFloat.clamp(tNormBase, 0, 1)
+            let baseTarget = tNorm * car.maxSpeed
+            
+            // Outside-ring boost → max + 280 (with a small epsilon)
+            let overshootEps: CGFloat = 6
+            let outside = dRaw > outerR + overshootEps
+            let targetSpeed: CGFloat
+            if outside {
+                targetSpeed = car.maxSpeed + 280
+                car.speedCapBonus = 280              // lift forward speed cap while outside
+            } else {
+                targetSpeed = baseTarget
+                car.speedCapBonus = 0                // normal cap when inside
+            }
+            
             if lockAngleUntilExitDeadzone || dRaw <= innerR + 4 {
-                // Inside inner ring: coast (no thrust), but we keep steer at 0.001 above
-                // so the CarNode brake clamp doesn’t engage → no instant stop.
+                // Inside inner ring: coast (no thrust)
                 car.throttle = 0
             } else {
                 // Normal speed controller toward targetSpeed
@@ -828,7 +1366,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
                 let deadband: CGFloat = 25
                 let accelGain: CGFloat = 280
                 
-                let hold = (0.06 + 0.34 * pow(targetNorm, 1.15)) // baseline feed-forward
+                let hold = (0.06 + 0.34 * pow(tNorm, 1.15)) // baseline feed-forward
                 var throttleCmd: CGFloat = 0
                 if err > deadband {
                     throttleCmd = min(1, (err - deadband) / accelGain)
@@ -837,6 +1375,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
                 }
                 if fwdMag < targetSpeed * 0.92 { throttleCmd = max(throttleCmd, hold) }
                 
+                // Reduce throttle when pointed far from the target heading
                 let align = max(0, cos(angleErr))
                 if align < 0.25 { throttleCmd = min(throttleCmd, 0.12) }
                 
@@ -844,7 +1383,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
             }
             
         } else if isCoasting {
-            // Natural stop (coast) — do NOT instantly brake when finger leaves the ring
+            // Natural stop (coast) — no instant brake when finger leaves the ring
             let speed = car.physicsBody?.velocity.length ?? 0
             if speed < 8 {
                 car.throttle = 0
@@ -856,11 +1395,13 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
                 car.throttle = 0
                 car.steer = 0.001 // keep brake clamp off while coasting
             }
+            car.speedCapBonus = 0     // ensure boost is cleared while coasting
         } else {
             car.throttle = 0
             car.steer = 0
             hasAngleLP = false
             lockAngleUntilExitDeadzone = false
+            car.speedCapBonus = 0     // ensure boost is cleared when idle
         }
         
         car.update(dt)
@@ -874,11 +1415,10 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         let actualHeading = car.zRotation + .pi/2
         let desiredHeading = (hasAngleLP ? angleLP : actualHeading)
         updateHeadingHUD(desired: desiredHeading, actual: actualHeading)
-
+        
         // Cull bullets that left the world
         cullBulletsOutsideWorld()
     }
-    
     
     // MARK: - Spawn helpers
     private func safeSpawnPoint(in rect: CGRect, radius: CGFloat, attempts: Int = 128) -> CGPoint {
