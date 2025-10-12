@@ -15,6 +15,7 @@ enum Category {
     static let hole: UInt32       = 1 << 3
     static let checkpoint: UInt32 = 1 << 4
     static let ramp: UInt32       = 1 << 5
+    static let bullet: UInt32     = 1 << 6
 }
 
 func shortestAngle(from a: CGFloat, to b: CGFloat) -> CGFloat {

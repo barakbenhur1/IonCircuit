@@ -9,7 +9,6 @@ import SpriteKit
 import UIKit
 
 final class GameScene: SKScene, SKPhysicsContactDelegate {
-    
     // ==== World & Car ====
     private let car = CarNode()
     private var openWorld: OpenWorldNode?
@@ -73,6 +72,24 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     private let headingPaletteActive = UIColor.white
     private let headingSize: CGFloat = 92   // diameter of dial
     
+    // ==== Fire button (bottom-right) ====
+    private let fireButton = SKNode()
+    private let fireBase = SKShapeNode()
+    private let fireIcon = SKShapeNode()
+
+    private var lastShotTime: TimeInterval = 0
+    private let fireCooldown: TimeInterval = 0.18
+    private let bulletSpeed: CGFloat = 2200
+    private let bulletLife: TimeInterval = 1.0
+    
+    // Multi-touch: separate pointers for drive & fire
+    private var driveTouch: UITouch?
+    private var fireTouch: UITouch?
+
+    // Auto-fire state
+    private var firing = false
+    private let fireActionKey = "autoFire"
+    
     // Spawn / walls
     private let spawnClearance: CGFloat = 80
     private let blockedMask: UInt32 = Category.wall
@@ -81,6 +98,8 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     override func didMove(to view: SKView) {
         backgroundColor = .black
         physicsWorld.contactDelegate = self
+        
+        view.isMultipleTouchEnabled = true
         
         // World
         let world = OpenWorldNode(config:
@@ -120,12 +139,18 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         // Correct top-speed for speed bar (car.maxSpeed is pts/s)
         kmhMaxShown = car.maxSpeed * kmhPerPointPerSecond
         
+        // Fire button
+        buildFireButton()
+        cam.addChild(fireButton)
+        placeFireButton()
+        
         placeHUD() // place both HUDs
     }
     
     override func didChangeSize(_ oldSize: CGSize) {
         super.didChangeSize(oldSize)
         placeHUD()
+        placeFireButton()
     }
     
     // MARK: - Speed ring build
@@ -380,21 +405,21 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         // Camera-local coords: origin center; top-left (-w/2,+h/2), bottom-right (+w/2,-h/2)
         let margin: CGFloat = 16
         let drop: CGFloat   = 30   // speed card top-left, 30px lower
-        
+
         let halfW = speedCard.frame.width  * 0.5
         let halfH = speedCard.frame.height * 0.5
-        
+
         // Speed HUD — top-left, 30 px down
         speedHUD.position = CGPoint(
             x: -size.width  * 0.5 + margin + halfW,
             y:  size.height * 0.5 - (margin + drop) - halfH
         )
-        
-        // Heading HUD — bottom-right
+
+        // Heading HUD — top-right, aligned to the same top edge as the speed HUD
         let r = headingSize * 0.5
         headingHUD.position = CGPoint(
             x:  size.width  * 0.5 - margin - r,
-            y: -size.height * 0.5 + margin + r
+            y:  size.height * 0.5 - (margin + drop) - r
         )
     }
     
@@ -474,63 +499,87 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     
     // MARK: - Touches
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let t = touches.first else { return }
-        isTouching = true
-        
-        let pScene = t.location(in: self)
-        guard isTouchOnCarScene(pScene) else {
-            controlArmed = false
-            fingerCam = nil
-            hideRing()
-            return
+        guard let cam = camera else { return }
+
+        for t in touches {
+            let pCam = t.location(in: cam)
+
+            // --- Fire button (start auto-fire; do not block driving) ---
+            if fireTouch == nil, pointInsideFireButton(pCam) {
+                fireTouch = t
+                startAutoFire()
+                // small press animation
+                fireButton.removeAction(forKey: "press")
+                let down = SKAction.scale(to: 0.94, duration: 0.05)
+                let up   = SKAction.scale(to: 1.00, duration: 0.08)
+                fireButton.run(.sequence([down, up]), withKey: "press")
+                continue
+            }
+
+            // --- Driving (first drive touch must begin on the car) ---
+            if driveTouch == nil {
+                let pScene = t.location(in: self)
+                if isTouchOnCarScene(pScene) {
+                    driveTouch = t
+                    isTouching = true
+                    controlArmed = true
+                    isCoasting = false
+
+                    // anchor at center; seed angle = current heading (no jump)
+                    fingerCam = .zero
+                    hasAngleLP = true
+                    angleLP = car.zRotation + .pi/2
+                    lockAngleUntilExitDeadzone = true
+
+                    showRing()
+                    ringHandle.position = .zero
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                }
+            }
         }
-        controlArmed = true
-        isCoasting = false
-        
-        // anchor at center; seed angle = current heading (no jump)
-        fingerCam = .zero
-        hasAngleLP = true
-        angleLP = car.zRotation + .pi/2
-        
-        // freeze heading until finger exits inner ring
-        lockAngleUntilExitDeadzone = true
-        
-        showRing()
-        ringHandle.position = .zero
-        UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }
     
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let t = touches.first, let cam = camera else { return }
-        isTouching = true
-        fingerCam = t.location(in: cam)
-        guard controlArmed else { return }
-        
-        let v = CGVector(dx: fingerCam!.x, dy: fingerCam!.y)
-        let dRaw = hypot(v.dx, v.dy)
-        let (innerR, outerR) = currentRadii()
-        let dClamp = CGFloat.clamp(dRaw, innerR, outerR)
-        let angRaw = atan2(v.dy, v.dx)
-        
-        ringHandle.position = CGPoint(x: cos(angRaw) * dClamp, y: sin(angRaw) * dClamp)
-        
-        // Active band highlight
-        let tNorm = (dClamp - innerR) / max(outerR - innerR, 1)
-        let idx = max(0, min(4, Int(floor(tNorm * 5))))
-        setActiveBand(index: idx)
-        
-        // once outside the inner ring, allow heading updates
-        if lockAngleUntilExitDeadzone, dRaw > innerR + 4 {
-            lockAngleUntilExitDeadzone = false
+        guard let cam = camera else { return }
+
+        if let dt = driveTouch, touches.contains(dt) {
+            isTouching = true
+            fingerCam = dt.location(in: cam)
+            guard controlArmed, let f = fingerCam else { return }
+
+            let v = CGVector(dx: f.x, dy: f.y)
+            let dRaw = hypot(v.dx, v.dy)
+            let (innerR, outerR) = currentRadii()
+            let dClamp = CGFloat.clamp(dRaw, innerR, outerR)
+            let angRaw = atan2(v.dy, v.dx)
+
+            ringHandle.position = CGPoint(x: cos(angRaw) * dClamp, y: sin(angRaw) * dClamp)
+
+            let tNorm = (dClamp - innerR) / max(outerR - innerR, 1)
+            let idx = max(0, min(4, Int(floor(tNorm * 5))))
+            setActiveBand(index: idx)
+
+            if lockAngleUntilExitDeadzone, dRaw > innerR + 4 {
+                lockAngleUntilExitDeadzone = false
+            }
         }
     }
     
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-        isTouching = false
-        controlArmed = false
-        fingerCam = nil
-        hideRing()
-        isCoasting = true
+        for t in touches {
+            if let ft = fireTouch, t === ft {
+                fireTouch = nil
+                stopAutoFire()
+            }
+            if let dt = driveTouch, t === dt {
+                driveTouch = nil
+                isTouching = false
+                controlArmed = false
+                fingerCam = nil
+                hideRing()
+                isCoasting = true
+            }
+        }
     }
     
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -566,6 +615,112 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         setActiveBand(index: -1)
         activeHalo.removeAllActions()
         activeHalo.alpha = 0
+    }
+    
+    // MARK: - Fire button build/placement
+    private func buildFireButton() {
+        fireButton.zPosition = 500
+
+        // Base circle
+        let R: CGFloat = 40
+        fireBase.path = CGPath(ellipseIn: CGRect(x: -R, y: -R, width: R*2, height: R*2), transform: nil)
+        fireBase.fillColor = UIColor(red: 0.95, green: 0.18, blue: 0.25, alpha: 0.90)
+        fireBase.strokeColor = UIColor.white.withAlphaComponent(0.18)
+        fireBase.lineWidth = 1.5
+        fireBase.glowWidth = 2
+        fireButton.addChild(fireBase)
+
+        // Crosshair icon
+        let p = CGMutablePath()
+        p.addEllipse(in: CGRect(x: -10, y: -10, width: 20, height: 20))
+        p.move(to: CGPoint(x: 0, y: 14));  p.addLine(to: CGPoint(x: 0, y: 22))
+        p.move(to: CGPoint(x: 0, y: -14)); p.addLine(to: CGPoint(x: 0, y: -22))
+        p.move(to: CGPoint(x: 14, y: 0));  p.addLine(to: CGPoint(x: 22, y: 0))
+        p.move(to: CGPoint(x: -14, y: 0)); p.addLine(to: CGPoint(x: -22, y: 0))
+        fireIcon.path = p
+        fireIcon.strokeColor = .white
+        fireIcon.lineWidth = 2.0
+        fireIcon.lineCap = .round
+        fireIcon.fillColor = .clear
+        fireButton.addChild(fireIcon)
+    }
+
+    private func placeFireButton() {
+        let margin: CGFloat = 20
+        let R: CGFloat = 40
+        fireButton.position = CGPoint(
+            x:  size.width * 0.5 - margin - R,
+            y: -size.height * 0.5 + margin + R
+        )
+    }
+
+    private func pointInsideFireButton(_ pCam: CGPoint) -> Bool {
+        let local = CGPoint(x: pCam.x - fireButton.position.x, y: pCam.y - fireButton.position.y)
+        return hypot(local.x, local.y) <= 44
+    }
+    
+    // MARK: - Shooting
+    private func fireOnce() {
+        let now = CACurrentMediaTime()
+        if now - lastShotTime < fireCooldown { return }
+        lastShotTime = now
+
+        // From car nose, along its forward (+Y in car space)
+        let heading = car.zRotation + .pi/2
+        let fwd = CGVector(dx: cos(heading), dy: sin(heading))
+        let muzzleOffset: CGFloat = 26
+        let origin = CGPoint(x: car.position.x + fwd.dx * muzzleOffset,
+                             y: car.position.y + fwd.dy * muzzleOffset)
+
+        // Bullet velocity = car velocity + projectile speed
+        let carVel = car.physicsBody?.velocity ?? .zero
+        let vel = CGVector(dx: carVel.dx + fwd.dx * bulletSpeed,
+                           dy: carVel.dy + fwd.dy * bulletSpeed)
+
+        // Visual bullet
+        let bullet = SKShapeNode(circleOfRadius: 3.5)
+        bullet.fillColor = .white
+        bullet.strokeColor = UIColor.white.withAlphaComponent(0.25)
+        bullet.lineWidth = 0.8
+        bullet.glowWidth = 2.0
+        bullet.position = origin
+
+        // Physics (no collisions needed)
+        let pb = SKPhysicsBody(circleOfRadius: 3.5)
+        pb.affectedByGravity = false
+        pb.allowsRotation = false
+        pb.linearDamping = 0
+        pb.friction = 0
+        pb.collisionBitMask = 0
+        pb.contactTestBitMask = 0
+        pb.velocity = vel
+        bullet.physicsBody = pb
+
+        addChild(bullet)
+        bullet.run(.sequence([.wait(forDuration: bulletLife), .removeFromParent()]))
+
+        // Button tap feedback
+        fireButton.removeAction(forKey: "press")
+        let down = SKAction.scale(to: 0.94, duration: 0.05)
+        let up   = SKAction.scale(to: 1.00, duration: 0.08)
+        fireButton.run(.sequence([down, up]), withKey: "press")
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    }
+    
+    private func startAutoFire() {
+        guard !firing else { return }
+        firing = true
+        fireOnce() // immediate shot
+        let seq = SKAction.sequence([
+            .wait(forDuration: fireCooldown),
+            .run { [weak self] in self?.fireOnce() }
+        ])
+        run(.repeatForever(seq), withKey: fireActionKey)
+    }
+
+    private func stopAutoFire() {
+        firing = false
+        removeAction(forKey: fireActionKey)
     }
     
     // MARK: - Update
