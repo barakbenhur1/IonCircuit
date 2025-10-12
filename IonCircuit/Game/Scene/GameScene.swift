@@ -76,7 +76,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     private let fireButton = SKNode()
     private let fireBase = SKShapeNode()
     private let fireIcon = SKShapeNode()
-
+    
     private var lastShotTime: TimeInterval = 0
     private let fireCooldown: TimeInterval = 0.18
     private let bulletSpeed: CGFloat = 2200
@@ -85,7 +85,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     // Multi-touch: separate pointers for drive & fire
     private var driveTouch: UITouch?
     private var fireTouch: UITouch?
-
+    
     // Auto-fire state
     private var firing = false
     private let fireActionKey = "autoFire"
@@ -405,16 +405,16 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         // Camera-local coords: origin center; top-left (-w/2,+h/2), bottom-right (+w/2,-h/2)
         let margin: CGFloat = 16
         let drop: CGFloat   = 30   // speed card top-left, 30px lower
-
+        
         let halfW = speedCard.frame.width  * 0.5
         let halfH = speedCard.frame.height * 0.5
-
+        
         // Speed HUD — top-left, 30 px down
         speedHUD.position = CGPoint(
             x: -size.width  * 0.5 + margin + halfW,
             y:  size.height * 0.5 - (margin + drop) - halfH
         )
-
+        
         // Heading HUD — top-right, aligned to the same top edge as the speed HUD
         let r = headingSize * 0.5
         headingHUD.position = CGPoint(
@@ -468,18 +468,18 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         // atan2 gives 0 at +X → subtract π/2.
         let desiredRot = normalizeAngle(angDesired - .pi/2)
         let actualRot  = normalizeAngle(angActual  - .pi/2)
-
+        
         // Color + brightness
         let color: UIColor = (activeBand >= 0 && activeBand < ringPalette.count)
-            ? ringPalette[activeBand]
-            : UIColor.systemTeal
+        ? ringPalette[activeBand]
+        : UIColor.systemTeal
         headingNeedleTarget.fillColor = color.withAlphaComponent(isTouching ? 0.95 : 0.75)
         headingNeedleActual.fillColor = UIColor.white.withAlphaComponent(0.85)
-
+        
         // Apply rotations
         headingNeedleTarget.zRotation = desiredRot
         headingNeedleActual.zRotation = actualRot
-
+        
         // Subtle breathing when touching
         if isTouching && headingHUD.action(forKey: "pulse") == nil {
             let up = SKAction.fadeAlpha(to: 1.0, duration: 0.15)
@@ -500,10 +500,10 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     // MARK: - Touches
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let cam = camera else { return }
-
+        
         for t in touches {
             let pCam = t.location(in: cam)
-
+            
             // --- Fire button (start auto-fire; do not block driving) ---
             if fireTouch == nil, pointInsideFireButton(pCam) {
                 fireTouch = t
@@ -515,7 +515,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
                 fireButton.run(.sequence([down, up]), withKey: "press")
                 continue
             }
-
+            
             // --- Driving (first drive touch must begin on the car) ---
             if driveTouch == nil {
                 let pScene = t.location(in: self)
@@ -524,13 +524,13 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
                     isTouching = true
                     controlArmed = true
                     isCoasting = false
-
+                    
                     // anchor at center; seed angle = current heading (no jump)
                     fingerCam = .zero
                     hasAngleLP = true
                     angleLP = car.zRotation + .pi/2
                     lockAngleUntilExitDeadzone = true
-
+                    
                     showRing()
                     ringHandle.position = .zero
                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
@@ -541,24 +541,24 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let cam = camera else { return }
-
+        
         if let dt = driveTouch, touches.contains(dt) {
             isTouching = true
             fingerCam = dt.location(in: cam)
             guard controlArmed, let f = fingerCam else { return }
-
+            
             let v = CGVector(dx: f.x, dy: f.y)
             let dRaw = hypot(v.dx, v.dy)
             let (innerR, outerR) = currentRadii()
             let dClamp = CGFloat.clamp(dRaw, innerR, outerR)
             let angRaw = atan2(v.dy, v.dx)
-
+            
             ringHandle.position = CGPoint(x: cos(angRaw) * dClamp, y: sin(angRaw) * dClamp)
-
+            
             let tNorm = (dClamp - innerR) / max(outerR - innerR, 1)
             let idx = max(0, min(4, Int(floor(tNorm * 5))))
             setActiveBand(index: idx)
-
+            
             if lockAngleUntilExitDeadzone, dRaw > innerR + 4 {
                 lockAngleUntilExitDeadzone = false
             }
@@ -620,7 +620,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     // MARK: - Fire button build/placement
     private func buildFireButton() {
         fireButton.zPosition = 500
-
+        
         // Base circle
         let R: CGFloat = 40
         fireBase.path = CGPath(ellipseIn: CGRect(x: -R, y: -R, width: R*2, height: R*2), transform: nil)
@@ -629,7 +629,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         fireBase.lineWidth = 1.5
         fireBase.glowWidth = 2
         fireButton.addChild(fireBase)
-
+        
         // Crosshair icon
         let p = CGMutablePath()
         p.addEllipse(in: CGRect(x: -10, y: -10, width: 20, height: 20))
@@ -644,7 +644,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         fireIcon.fillColor = .clear
         fireButton.addChild(fireIcon)
     }
-
+    
     private func placeFireButton() {
         let margin: CGFloat = 20
         let R: CGFloat = 40
@@ -653,7 +653,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
             y: -size.height * 0.5 + margin + R
         )
     }
-
+    
     private func pointInsideFireButton(_ pCam: CGPoint) -> Bool {
         let local = CGPoint(x: pCam.x - fireButton.position.x, y: pCam.y - fireButton.position.y)
         return hypot(local.x, local.y) <= 44
@@ -664,19 +664,19 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         let now = CACurrentMediaTime()
         if now - lastShotTime < fireCooldown { return }
         lastShotTime = now
-
+        
         // From car nose, along its forward (+Y in car space)
         let heading = car.zRotation + .pi/2
         let fwd = CGVector(dx: cos(heading), dy: sin(heading))
         let muzzleOffset: CGFloat = 26
         let origin = CGPoint(x: car.position.x + fwd.dx * muzzleOffset,
                              y: car.position.y + fwd.dy * muzzleOffset)
-
+        
         // Bullet velocity = car velocity + projectile speed
         let carVel = car.physicsBody?.velocity ?? .zero
         let vel = CGVector(dx: carVel.dx + fwd.dx * bulletSpeed,
                            dy: carVel.dy + fwd.dy * bulletSpeed)
-
+        
         // Visual bullet
         let bullet = SKShapeNode(circleOfRadius: 3.5)
         bullet.fillColor = .white
@@ -684,7 +684,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         bullet.lineWidth = 0.8
         bullet.glowWidth = 2.0
         bullet.position = origin
-
+        
         // Physics (no collisions needed)
         let pb = SKPhysicsBody(circleOfRadius: 3.5)
         pb.affectedByGravity = false
@@ -695,10 +695,10 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         pb.contactTestBitMask = 0
         pb.velocity = vel
         bullet.physicsBody = pb
-
+        
         addChild(bullet)
         bullet.run(.sequence([.wait(forDuration: bulletLife), .removeFromParent()]))
-
+        
         // Button tap feedback
         fireButton.removeAction(forKey: "press")
         let down = SKAction.scale(to: 0.94, duration: 0.05)
@@ -717,7 +717,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         ])
         run(.repeatForever(seq), withKey: fireActionKey)
     }
-
+    
     private func stopAutoFire() {
         firing = false
         removeAction(forKey: fireActionKey)
@@ -756,6 +756,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
                     hasAngleLP = true
                 }
             }
+            
             // radius → normalized target speed (0..1)
             let tNorm = (dClamped <= innerR + 1)
             ? 0
@@ -767,37 +768,45 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
             let heading  = car.zRotation + .pi/2
             let angleErr = shortestAngle(from: heading, to: angleLP)
             if lockAngleUntilExitDeadzone || dRaw <= innerR + 4 {
-                car.steer = 0
+                // Tiny epsilon steer so CarNode doesn’t trigger the “parking brake”
+                car.steer = 0.001
             } else {
                 let steerP = angleErr / (.pi/3)         // ±1 @ ~60°
                 car.steer  = tanh(2.1 * steerP)
             }
             
-            // --- SPEED CONTROLLER (no negative throttle = no low-speed chatter) ---
+            // ---- THROTTLE ----
             let fwd = CGVector(dx: cos(heading), dy: sin(heading))
             let v   = pb.velocity
             let fwdMag = v.dx * fwd.dx + v.dy * fwd.dy
             
-            let err = targetSpeed - max(0, fwdMag)
-            let deadband: CGFloat = 25
-            let accelGain: CGFloat = 280
-            
-            let hold = (0.06 + 0.34 * pow(targetNorm, 1.15)) // baseline feed-forward
-            var throttleCmd: CGFloat = 0
-            if err > deadband {
-                throttleCmd = min(1, (err - deadband) / accelGain)
+            if lockAngleUntilExitDeadzone || dRaw <= innerR + 4 {
+                // Inside inner ring: coast (no thrust), but we keep steer at 0.001 above
+                // so the CarNode brake clamp doesn’t engage → no instant stop.
+                car.throttle = 0
             } else {
-                throttleCmd = 0
+                // Normal speed controller toward targetSpeed
+                let err = targetSpeed - max(0, fwdMag)
+                let deadband: CGFloat = 25
+                let accelGain: CGFloat = 280
+                
+                let hold = (0.06 + 0.34 * pow(targetNorm, 1.15)) // baseline feed-forward
+                var throttleCmd: CGFloat = 0
+                if err > deadband {
+                    throttleCmd = min(1, (err - deadband) / accelGain)
+                } else {
+                    throttleCmd = 0
+                }
+                if fwdMag < targetSpeed * 0.92 { throttleCmd = max(throttleCmd, hold) }
+                
+                let align = max(0, cos(angleErr))
+                if align < 0.25 { throttleCmd = min(throttleCmd, 0.12) }
+                
+                car.throttle = CGFloat.clamp(throttleCmd, 0, 1)
             }
-            if fwdMag < targetSpeed * 0.92 { throttleCmd = max(throttleCmd, hold) }
-            
-            let align = max(0, cos(angleErr))
-            if align < 0.25 { throttleCmd = min(throttleCmd, 0.12) }
-            
-            car.throttle = CGFloat.clamp(throttleCmd, 0, 1)
             
         } else if isCoasting {
-            // Natural stop (coast)
+            // Natural stop (coast) — do NOT instantly brake when finger leaves the ring
             let speed = car.physicsBody?.velocity.length ?? 0
             if speed < 8 {
                 car.throttle = 0
@@ -807,7 +816,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
                 lockAngleUntilExitDeadzone = false
             } else {
                 car.throttle = 0
-                car.steer = 0.001
+                car.steer = 0.001 // keep brake clamp off while coasting
             }
         } else {
             car.throttle = 0
@@ -828,6 +837,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         let desiredHeading = (hasAngleLP ? angleLP : actualHeading)
         updateHeadingHUD(desired: desiredHeading, actual: actualHeading)
     }
+    
     
     // MARK: - Spawn helpers
     private func safeSpawnPoint(in rect: CGRect, radius: CGFloat, attempts: Int = 128) -> CGPoint {
