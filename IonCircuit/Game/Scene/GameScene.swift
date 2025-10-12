@@ -72,23 +72,29 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     private let headingPaletteActive = UIColor.white
     private let headingSize: CGFloat = 92   // diameter of dial
     
-    // ==== Fire button (bottom-right) ====
+    // ==== Fire (button / bullets) ====
     private let fireButton = SKNode()
     private let fireBase = SKShapeNode()
     private let fireIcon = SKShapeNode()
-    
-    private var lastShotTime: TimeInterval = 0
-    private let fireCooldown: TimeInterval = 0.18
-    private let bulletSpeed: CGFloat = 2200
-    private let bulletLife: TimeInterval = 1.0
-    
-    // Multi-touch: separate pointers for drive & fire
+
+    // Tap = singles; Hold = rapid
+    private var lastManualShot: TimeInterval = 0
+    private let singleTapCooldown: TimeInterval = 0.22   // tap spam limiter
+    private let autoFireInterval: TimeInterval = 0.24    // hold rate (fast)
+    private let autoFireArmDelay: TimeInterval = 0.18    // how long to hold before burst
+
     private var driveTouch: UITouch?
     private var fireTouch: UITouch?
-    
-    // Auto-fire state
     private var firing = false
-    private let fireActionKey = "autoFire"
+    private let autoFireKey = "autoFireLoop"
+    private let autoArmKey  = "autoFireArm"
+
+    private let bulletSpeed: CGFloat = 2200
+    private let bulletLife: TimeInterval = 1.0
+
+    // World bounds used to cull bullets
+    private var worldBounds: CGRect = .zero
+
     
     // Spawn / walls
     private let spawnClearance: CGFloat = 80
@@ -102,11 +108,18 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         view.isMultipleTouchEnabled = true
         
         // World
-        let world = OpenWorldNode(config:
-                .init(size: CGSize(width: size.width * 100.0,
-                                   height: size.height * 100.0)))
+        // World
+        let worldSize = CGSize(width: size.width * 100.0,
+                               height: size.height * 100.0)
+        let world = OpenWorldNode(config: .init(size: worldSize))
         addChild(world)
         openWorld = world
+
+        // Centered world: (-W/2,-H/2) .. (+W/2,+H/2)
+        worldBounds = CGRect(x: -worldSize.width * 0.5,
+                             y: -worldSize.height * 0.5,
+                             width: worldSize.width,
+                             height: worldSize.height)
         
         // Car
         let searchRect = frame.insetBy(dx: 160, dy: 160)
@@ -505,14 +518,10 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
             let pCam = t.location(in: cam)
             
             // --- Fire button (start auto-fire; do not block driving) ---
+            // --- Fire button (start auto-fire; do not block driving) ---
             if fireTouch == nil, pointInsideFireButton(pCam) {
                 fireTouch = t
                 startAutoFire()
-                // small press animation
-                fireButton.removeAction(forKey: "press")
-                let down = SKAction.scale(to: 0.94, duration: 0.05)
-                let up   = SKAction.scale(to: 1.00, duration: 0.08)
-                fireButton.run(.sequence([down, up]), withKey: "press")
                 continue
             }
             
@@ -659,33 +668,46 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         return hypot(local.x, local.y) <= 44
     }
     
-    // MARK: - Shooting
-    private func fireOnce() {
-        let now = CACurrentMediaTime()
-        if now - lastShotTime < fireCooldown { return }
-        lastShotTime = now
-        
+    private func cullBulletsOutsideWorld() {
+        guard worldBounds.width > 0 && worldBounds.height > 0 else { return }
+        enumerateChildNodes(withName: "bullet") { node, _ in
+            if !self.worldBounds.contains(node.position) {
+                node.removeAllActions()
+                node.removeFromParent()
+            }
+        }
+    }
+    
+    private func animateFireTap() {
+        fireButton.removeAction(forKey: "press")
+        let down = SKAction.scale(to: 0.94, duration: 0.05)
+        let up   = SKAction.scale(to: 1.00, duration: 0.08)
+        fireButton.run(.sequence([down, up]), withKey: "press")
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    }
+
+    @discardableResult
+    private func spawnBullet() -> SKNode {
         // From car nose, along its forward (+Y in car space)
         let heading = car.zRotation + .pi/2
         let fwd = CGVector(dx: cos(heading), dy: sin(heading))
         let muzzleOffset: CGFloat = 26
         let origin = CGPoint(x: car.position.x + fwd.dx * muzzleOffset,
                              y: car.position.y + fwd.dy * muzzleOffset)
-        
+
         // Bullet velocity = car velocity + projectile speed
         let carVel = car.physicsBody?.velocity ?? .zero
         let vel = CGVector(dx: carVel.dx + fwd.dx * bulletSpeed,
                            dy: carVel.dy + fwd.dy * bulletSpeed)
-        
-        // Visual bullet
+
         let bullet = SKShapeNode(circleOfRadius: 3.5)
+        bullet.name = "bullet"
         bullet.fillColor = .white
         bullet.strokeColor = UIColor.white.withAlphaComponent(0.25)
         bullet.lineWidth = 0.8
         bullet.glowWidth = 2.0
         bullet.position = origin
-        
-        // Physics (no collisions needed)
+
         let pb = SKPhysicsBody(circleOfRadius: 3.5)
         pb.affectedByGravity = false
         pb.allowsRotation = false
@@ -695,32 +717,48 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         pb.contactTestBitMask = 0
         pb.velocity = vel
         bullet.physicsBody = pb
-        
+
         addChild(bullet)
         bullet.run(.sequence([.wait(forDuration: bulletLife), .removeFromParent()]))
-        
-        // Button tap feedback
-        fireButton.removeAction(forKey: "press")
-        let down = SKAction.scale(to: 0.94, duration: 0.05)
-        let up   = SKAction.scale(to: 1.00, duration: 0.08)
-        fireButton.run(.sequence([down, up]), withKey: "press")
-        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        return bullet
+    }
+
+    private func fireOnceManual() {
+        let now = CACurrentMediaTime()
+        if now - lastManualShot < singleTapCooldown { return }
+        lastManualShot = now
+        _ = spawnBullet()
+        animateFireTap()
     }
     
     private func startAutoFire() {
         guard !firing else { return }
         firing = true
-        fireOnce() // immediate shot
-        let seq = SKAction.sequence([
-            .wait(forDuration: fireCooldown),
-            .run { [weak self] in self?.fireOnce() }
+
+        // Single shot immediately on press
+        fireOnceManual()
+
+        // Arm burst only if held beyond the delay
+        removeAction(forKey: autoArmKey)
+        let arm = SKAction.sequence([
+            .wait(forDuration: autoFireArmDelay),
+            .run { [weak self] in
+                guard let self, self.firing else { return }
+                // Rapid loop; not throttled by tap cooldown
+                let loop = SKAction.sequence([
+                    .wait(forDuration: self.autoFireInterval),
+                    .run { [weak self] in _ = self?.spawnBullet() }
+                ])
+                self.run(.repeatForever(loop), withKey: self.autoFireKey)
+            }
         ])
-        run(.repeatForever(seq), withKey: fireActionKey)
+        run(arm, withKey: autoArmKey)
     }
-    
+
     private func stopAutoFire() {
         firing = false
-        removeAction(forKey: fireActionKey)
+        removeAction(forKey: autoArmKey)
+        removeAction(forKey: autoFireKey)
     }
     
     // MARK: - Update
@@ -836,6 +874,9 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         let actualHeading = car.zRotation + .pi/2
         let desiredHeading = (hasAngleLP ? angleLP : actualHeading)
         updateHeadingHUD(desired: desiredHeading, actual: actualHeading)
+
+        // Cull bullets that left the world
+        cullBulletsOutsideWorld()
     }
     
     
