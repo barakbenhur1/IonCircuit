@@ -7,6 +7,7 @@
 
 import SpriteKit
 import UIKit
+import ObjectiveC
 
 final class CarNode: SKNode {
     // ---- Tuning ----
@@ -264,7 +265,7 @@ final class CarNode: SKNode {
         let newSpeed = hypot(pb.velocity.dx, pb.velocity.dy)
         updateExhaust(speed: newSpeed, fwdMag: fwdMag, dt: dt)
     }
-
+    
     
     // MARK: - Exhaust helpers
     
@@ -371,4 +372,102 @@ final class CarNode: SKNode {
             e.particleAlphaSpeed = alphaSpeed
         }
     }
+}
+
+// MARK: - Air / Verticality for CarNode
+extension CarNode {
+    // Public-ish tuning
+    var gravity: CGFloat { get { objc_getAssociatedObject(self, &Assoc.g) as? CGFloat ?? -1800 }
+        set { objc_setAssociatedObject(self, &Assoc.g, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) } }
+    var zLift: CGFloat { get { objc_getAssociatedObject(self, &Assoc.z) as? CGFloat ?? 0 }
+        set { objc_setAssociatedObject(self, &Assoc.z, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) } }
+    var vz: CGFloat { get { objc_getAssociatedObject(self, &Assoc.v) as? CGFloat ?? 0 }
+        set { objc_setAssociatedObject(self, &Assoc.v, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) } }
+    var isAirborne: Bool { get { objc_getAssociatedObject(self, &Assoc.a) as? Bool ?? false }
+        set { objc_setAssociatedObject(self, &Assoc.a, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) } }
+    
+    private var _groundMask: UInt32 {
+        get { objc_getAssociatedObject(self, &Assoc.m) as? UInt32 ?? (physicsBody?.collisionBitMask ?? 0) }
+        set { objc_setAssociatedObject(self, &Assoc.m, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
+    }
+    private var shadowNode: SKShapeNode? {
+        get { objc_getAssociatedObject(self, &Assoc.s) as? SKShapeNode }
+        set { objc_setAssociatedObject(self, &Assoc.s, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
+    }
+    
+    /// Call once after the car is created (e.g. in GameScene.didMove)
+    func enableAirPhysics() {
+        _groundMask = physicsBody?.collisionBitMask ?? 0
+        
+        // soft oval shadow
+        let sh = SKShapeNode(ellipseOf: CGSize(width: 44, height: 18))
+        sh.fillColor = .black
+        sh.strokeColor = .clear
+        sh.alpha = 0.35
+        sh.zPosition = -1
+        addChild(sh)
+        shadowNode = sh
+    }
+    
+    /// Integrate vertical axis and gate collisions while airborne.
+    func stepVertical(dt: CGFloat, groundHeight: CGFloat) {
+        let wasAir = isAirborne
+        
+        // simple ballistic integration
+        vz += gravity * dt
+        zLift += vz * dt
+        
+        if zLift <= groundHeight {
+            // Land
+            zLift = groundHeight
+            if vz < 0 { vz = 0 }
+            isAirborne = false
+        } else {
+            isAirborne = true
+        }
+        
+        // Collision gating (fly over walls/obstacles while airborne)
+        if let pb = physicsBody {
+            if isAirborne { pb.collisionBitMask = 0 }
+            else          { pb.collisionBitMask = _groundMask }
+        }
+        
+        // Visuals (shadow squashes/fades with height)
+        if let sh = shadowNode {
+            let h = max(0, min(1, zLift / 240)) // 0..1 scale for ~240pt height
+            sh.alpha = 0.35 * (1 - 0.75*h)
+            let w: CGFloat = 44 + 32*h
+            let t: CGFloat = 18 + 28*h
+            sh.path = CGPath(ellipseIn: CGRect(x: -w/2, y: -t/2, width: w, height: t), transform: nil)
+            sh.position = .zero
+        }
+        
+        // Optional tiny bounce/haptic when landing
+        if wasAir && !isAirborne {
+            removeAction(forKey: "landPop")
+            let pop = SKAction.sequence([.scale(to: 1.04, duration: 0.05),
+                                         .scale(to: 1.00, duration: 0.08)])
+            run(pop, withKey: "landPop")
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        }
+    }
+    
+    /// Convert horizontal speed + ramp strength into a vertical impulse.
+    func applyRampImpulse(vzAdd: CGFloat, forwardBoost: CGFloat, heading: CGFloat) {
+        vz = max(vz, vzAdd)
+        if let pb = physicsBody, forwardBoost > 0 {
+            pb.applyImpulse(CGVector(dx: cos(heading)*forwardBoost,
+                                     dy: sin(heading)*forwardBoost))
+        }
+    }
+}
+
+// ObjC associated keys to store extension state safely (UInt8 sentinels remove warnings)
+private enum Assoc {
+    static var g: UInt8 = 0
+    static var z: UInt8 = 0
+    static var v: UInt8 = 0
+    static var a: UInt8 = 0
+    static var m: UInt8 = 0
+    static var s: UInt8 = 0
 }

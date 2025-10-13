@@ -32,15 +32,7 @@ func lerpAngle(_ a: CGFloat, _ b: CGFloat, alpha: CGFloat) -> CGFloat {
     return a + d * alpha
 }
 
-// Clamp helpers
-extension CGFloat {
-    static func clamp(_ v: CGFloat, _ a: CGFloat, _ b: CGFloat) -> CGFloat {
-        return Swift.min(Swift.max(v, a), b)
-    }
-    func clamped(_ a: CGFloat, _ b: CGFloat) -> CGFloat {
-        return CGFloat.clamp(self, a, b)
-    }
-}
+
 
 // Vector utilities
 extension CGVector {
@@ -57,9 +49,5 @@ extension SKNode {
         get { physicsBody?.velocity ?? .zero }
         set { physicsBody?.velocity = newValue }
     }
-}
-
-extension CGPoint {
-    func distance(to p: CGPoint) -> CGFloat { hypot(x - p.x, y - p.y) }
 }
 
