@@ -47,7 +47,6 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     private var angleLP: CGFloat = 0
     private var hasAngleLP = false
     private var lockAngleUntilExitDeadzone = false
-    
     private var isCoasting = false
     
     // ==== Speed Ring HUD ====
@@ -90,24 +89,23 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     private let headingW = SKLabelNode(text: "W")
     private let headingSize: CGFloat = 92
     
+    // ==== Ramp Pointer HUD ====
+    private let rampPointer = SKNode()
+    private let rampArrow   = SKShapeNode()       // acts as a container for inner parts
+    private let rampArrowBase = SKShapeNode()
+    private let rampArrowHead = SKShapeNode()
+    private let rampArrowPulse = SKShapeNode()
+    private let rampPointerMaxDistance: CGFloat = 1600
+    private let rampPointerMargin: CGFloat = 28
+    private var rampPointerBuilt = false
+    
     // ==== Fire (button / bullets) ====
     private let fireButton = SKNode()
     private let fireBase = SKShapeNode()
     private let fireIcon = SKShapeNode()
     
-    private var lastManualShot: TimeInterval = 0
-    private let singleTapCooldown: TimeInterval = 0.22
-    private let autoFireInterval: TimeInterval = 0.24
-    private let autoFireArmDelay: TimeInterval = 0.18
-    
     private var driveTouch: UITouch?
     private var fireTouch: UITouch?
-    private var firing = false
-    private let autoFireKey = "autoFireLoop"
-    private let autoArmKey  = "autoFireArm"
-    
-    private let bulletSpeed: CGFloat = 2200
-    private let bulletLife: TimeInterval = 1.0
     
     // World bounds
     private var worldBounds: CGRect = .zero
@@ -120,8 +118,6 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     private let minNeighborSpacing: CGFloat = 320
     private let coneSpacing: CGFloat = 32
     private let coneCountRange = 4...6
-    private let rampChance: CGFloat = 0.08
-    private let coneRowChance: CGFloat = 0.16
     private let spawnClearance: CGFloat = 80
     private let blockedMask: UInt32 = Category.wall
     
@@ -134,8 +130,69 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     private var worldSeed: UInt64 = 0
     private let obstacleRoot = SKNode()
     
+    private var _preCarVel: CGVector = .zero
+    private var _hadSolidContactThisStep = false
+    private var _lastDTForClamp: CGFloat = 1/60
+    private let _contactForwardBoostClampPerSec: CGFloat = 1400   // clamp contact-induced forward “kicks”
+    
     // ==== Hills ====
     private var hills: [HillNode] = []
+    
+    // UI / HUD
+    private let healthHUD = CarHealthHUDNode()
+    
+    // ==== Controls / Handedness ====
+    private var isLeftHanded = true
+    private var controlsLockedForOverlay = false
+    private var handednessOverlay: HandChoiceOverlayNode?
+    
+    // ==== Death freeze / pause ====
+    private var cameraFrozenPos: CGPoint?         // freeze camera here while dead
+    private var pausedForDeath = false            // NEW
+    
+    private let strictCentering = true
+    
+    private func pauseWorldForDeath() {           // NEW
+        guard !pausedForDeath else { return }
+        pausedForDeath = true
+        
+        // stop inputs
+        driveTouch = nil
+        fireTouch = nil
+        isTouching = false
+        controlArmed = false
+        car.stopAutoFire()
+        hideRing()
+        
+        // freeze simulation
+        physicsWorld.speed = 0
+        
+        // pause node trees that animate
+        openWorld?.isPaused = true
+        obstacleRoot.isPaused = true
+        
+        // IMPORTANT FIX: do NOT pause the car or its actions won't run (respawn never triggers)
+        // car.isPaused = true   // ← removed
+        
+        // optional: quiet HUD motion
+        speedHUD.isPaused = true
+        headingHUD.isPaused = true
+        rampPointer.isPaused = true
+    }
+    
+    private func resumeWorldAfterRespawn() {      // NEW
+        guard pausedForDeath else { return }
+        pausedForDeath = false
+        
+        physicsWorld.speed = 1
+        openWorld?.isPaused = false
+        obstacleRoot.isPaused = false
+        car.isPaused = false
+        
+        speedHUD.isPaused = false
+        headingHUD.isPaused = false
+        rampPointer.isPaused = false
+    }
     
     // MARK: - Scene lifecycle
     override func didMove(to view: SKView) {
@@ -160,6 +217,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         car.zRotation = 0
         addChild(car)
         car.enableAirPhysics()
+        car.delegate = self
         
         // Streaming root
         worldSeed = UInt64.random(in: 1...UInt64.max)
@@ -172,6 +230,8 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         camera = cam
         addChild(cam)
         cam.position = car.position
+        
+        buildRampPointerIfNeeded()
         
         // HUDs
         ringGroup.zPosition = 200
@@ -188,18 +248,49 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         
         kmhMaxShown = car.maxSpeed * kmhPerPointPerSecond
         
+        // Ramp pointer HUD (puck)
+        buildRampArrowHUD()
+        
         // Fire button
         buildFireButton()
         cam.addChild(fireButton)
         placeFireButton()
         
         placeHUD()
+        
+        // Health HUD
+        camera?.addChild(healthHUD)
+        placeHUD()
+        
+        // Car damage notifications → HUD
+        car.maxHP = 100
+        car.onHPChanged = { [weak self] hp, maxHP in
+            self?.healthHUD.set(hp: hp, maxHP: maxHP)
+        }
+        car.onHPChanged?(car.hp, car.maxHP)
+        car.enableCrashContacts()
+        
+        // Show handedness overlay EVERY time app opens (but don't block controls)
+        showHandednessPicker()
+    }
+    
+    private func showHandednessPicker() {
+        controlsLockedForOverlay = false
+        let ov = HandChoiceOverlayNode(size: size)
+        handednessOverlay = ov
+        camera?.addChild(ov)
+        ov.onPick = { [weak self] left in
+            guard let self else { return }
+            self.isLeftHanded = left
+            self.placeFireButton()
+        }
     }
     
     override func didChangeSize(_ oldSize: CGSize) {
         super.didChangeSize(oldSize)
         placeHUD()
         placeFireButton()
+        handednessOverlay?.updateSize(size)
     }
     
     // MARK: - Speed ring
@@ -255,6 +346,85 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         ringHandle.position = .zero
         ringHandle.zPosition = 1
         ringGroup.addChild(ringHandle)
+    }
+    
+    private func buildRampPointerIfNeeded() {
+        guard !rampPointerBuilt, let cam = camera else { return }
+        rampPointerBuilt = true
+        
+        rampPointer.zPosition = 650
+        rampPointer.isHidden = true
+        
+        // Make the arrow node a container; visuals are built in buildRampArrowHUD()
+        rampPointer.addChild(rampArrow)
+        cam.addChild(rampPointer)
+    }
+    
+    // World -> camera rect (centered on (0,0) in camera space)
+    private var cameraViewRect: CGRect {
+        CGRect(x: -size.width/2, y: -size.height/2, width: size.width, height: size.height)
+    }
+    
+    // Where you should aim to approach a ramp correctly (behind it along heading)
+    private func rampAimPoint(for ramp: RampNode) -> CGPoint {
+        let f = CGVector(dx: cos(ramp.heading), dy: sin(ramp.heading))
+        let fr = ramp.calculateAccumulatedFrame()
+        let along = max(fr.width, fr.height) * 0.60
+        return CGPoint(x: ramp.position.x - f.dx * along,
+                       y: ramp.position.y - f.dy * along)
+    }
+    
+    // Choose nearest off-screen, path-clear ramp and place arrow on screen edge
+    private func updateRampPointer() {
+        buildRampPointerIfNeeded()
+        guard let cam = camera else { return }
+        
+        let viewRect = cameraViewRect.insetBy(dx: rampPointerMargin, dy: rampPointerMargin)
+        let carPos   = car.position
+        
+        var bestAim: CGPoint?
+        var bestDist = CGFloat.greatestFiniteMagnitude
+        
+        // Find nearest *off-screen* ramp with a reasonably clear corridor to its approach point
+        let corridorMask: UInt32 = Category.wall | Category.obstacle | Category.hole
+        
+        for case let ramp as RampNode in obstacleRoot.children {
+            let aim = rampAimPoint(for: ramp)
+            let d = carPos.distance(to: aim)
+            if d > rampPointerMaxDistance { continue }
+            
+            let aimCam = cam.convert(aim, from: self)
+            if viewRect.contains(aimCam) { continue }
+            
+            if !pathClearCapsule(from: carPos, to: aim, radius: 44, mask: corridorMask) { continue }
+            
+            if d < bestDist { bestDist = d; bestAim = aim }
+        }
+        
+        // No candidate → hide
+        guard let targetWorld = bestAim else {
+            if !rampPointer.isHidden {
+                rampPointer.run(.sequence([.fadeOut(withDuration: 0.12), .hide()]))
+            }
+            return
+        }
+        
+        // Project to camera and clamp to screen edge
+        let tCam = cam.convert(targetWorld, from: self)
+        let halfW = size.width  * 0.5 - rampPointerMargin
+        let halfH = size.height * 0.5 - rampPointerMargin
+        
+        let k = max(abs(tCam.x) / max(halfW, 1), abs(tCam.y) / max(halfH, 1))  // >= 1 for off-screen points
+        let edge = CGPoint(x: tCam.x / max(k, 1), y: tCam.y / max(k, 1))       // clamp to edge rectangle
+        
+        rampPointer.position   = edge
+        rampPointer.zRotation  = atan2(tCam.y, tCam.x) - .pi/2   // arrow points along +Y in local space
+        
+        if rampPointer.isHidden {
+            rampPointer.alpha = 0
+            rampPointer.isHidden = false
+            rampPointer.run(.fadeAlpha(to: 1.0, duration: 0.12))
+        }
     }
     
     private func currentRadii() -> (inner: CGFloat, outer: CGFloat) {
@@ -443,16 +613,62 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         let halfW = speedCard.frame.width  * 0.5
         let halfH = speedCard.frame.height * 0.5
         
+        // Speed (top-left)
         speedHUD.position = CGPoint(
             x: -size.width  * 0.5 + margin + halfW,
             y:  size.height * 0.5 - (margin + drop) - halfH
         )
         
+        // Heading (top-right)
         let r = headingSize * 0.5
         headingHUD.position = CGPoint(
             x:  size.width  * 0.5 - margin - r,
             y:  size.height * 0.5 - (margin + drop) - r
         )
+        
+        // Health (under speed)
+        healthHUD.position = CGPoint(
+            x: -size.width * 0.5 + margin + 80,
+            y:  size.height * 0.5 - (margin + drop) - speedCard.frame.height - 18
+        )
+    }
+    
+    private func recenterCameraOnCar() {
+        guard let cam = camera else { return }
+        cam.removeAllActions()              // cancel any residual shake
+        cam.position = car.position         // hard-lock car at screen center
+    }
+
+    // Keep the camera lock AFTER physics each frame so it never lags
+    override func didSimulatePhysics() {
+        // If we're freezing on death, don't re-center until respawn
+        guard cameraFrozenPos == nil else { return }
+        defer { _hadSolidContactThisStep = false }
+        guard !_hadSolidContactThisStep else {
+            guard !car.isAirborne, let pb = car.physicsBody else { return }
+            let heading = car.zRotation + .pi/2
+            let fwd  = CGVector(dx: cos(heading),  dy: sin(heading))
+            let right = CGVector(dx: -sin(heading), dy: cos(heading))
+            
+            // pre/post forward components
+            let preF  = _preCarVel.dx * fwd.dx + _preCarVel.dy * fwd.dy
+            let post  = pb.velocity
+            let postF = post.dx * fwd.dx + post.dy * fwd.dy
+            let postLat = post.dx * right.dx + post.dy * right.dy
+            
+            // allow only a small forward gain per step from contacts
+            let maxDelta = _contactForwardBoostClampPerSec * _lastDTForClamp
+            if postF > preF + maxDelta {
+                let clampedF = preF + maxDelta
+                let newV = CGVector(
+                    dx: fwd.dx * clampedF + right.dx * postLat,
+                    dy: fwd.dy * clampedF + right.dy * postLat
+                )
+                pb.velocity = newV
+            }
+            return
+        }
+        recenterCameraOnCar()
     }
     
     private func updateSpeedHUD(kmh: CGFloat) {
@@ -537,65 +753,75 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         @inline(__always) func isWall(_ b: SKPhysicsBody) -> Bool { (b.categoryBitMask & Category.wall) != 0 }
         @inline(__always) func isCar(_ b: SKPhysicsBody) -> Bool { (b.categoryBitMask & Category.car) != 0 }
         @inline(__always) func isRamp(_ b: SKPhysicsBody) -> Bool { (b.categoryBitMask & Category.ramp) != 0 }
+        @inline(__always) func isHill(_ b: SKPhysicsBody) -> Bool { b.node is HillNode }
         @inline(__always) func killBullet(_ b: SKPhysicsBody) {
             b.node?.removeAllActions()
             b.node?.removeFromParent()
         }
-        @inline(__always) func shortestAngle(_ from: CGFloat, _ to: CGFloat) -> CGFloat {
-            var d = (to - from).truncatingRemainder(dividingBy: .pi * 2)
-            if d >= .pi { d -= .pi * 2 }
-            if d <= -.pi { d += .pi * 2 }
-            return d
-        }
         
-        // ------ Bullet ↔ Obstacle ------
+        // Bullet ↔ Obstacle
         if (isBullet(bodyA) && isObstacle(bodyB)) || (isBullet(bodyB) && isObstacle(bodyA)) {
             let bullet   = isBullet(bodyA) ? bodyA : bodyB
             let obstacle = isObstacle(bodyA) ? bodyA : bodyB
-            
             if let ob = obstacle.node as? ObstacleNode {
                 let hitScene = contact.contactPoint
                 let hitLocal = ob.convert(hitScene, from: self)
                 _ = ob.applyDamage(1, impact: hitLocal)
             }
-            killBullet(bullet)
-            return
+            killBullet(bullet); return
         }
         
-        // ------ Bullet ↔ Wall ------
+        // Bullet ↔ Wall
         if (isBullet(bodyA) && isWall(bodyB)) || (isBullet(bodyB) && isWall(bodyA)) {
             let bullet = isBullet(bodyA) ? bodyA : bodyB
-            killBullet(bullet)
-            return
+            killBullet(bullet); return
         }
         
-        // ------ Car ↔ Ramp (launch) ------
+        // Car ↔ Ramp (launch only; no damage here)
         if (isCar(bodyA) && isRamp(bodyB)) || (isCar(bodyB) && isRamp(bodyA)) {
             guard !car.isAirborne else { return }
-            
             let rampBody = isRamp(bodyA) ? bodyA : bodyB
             guard let ramp = rampBody.node as? RampNode else { return }
             
-            let carHeading = car.zRotation + .pi/2
-            var align = cos(shortestAngle(carHeading, ramp.heading))
+            let carHeading  = car.zRotation + .pi/2
+            var align = cos(self.shortestAngle(from: carHeading, to: ramp.heading))
             align = max(0, align)
             
             let spd = car.physicsBody?.velocity.length ?? 0
             let spdFrac = min(1, spd / max(1, car.maxSpeed))
             
-            // Skill-based: steeper ramps need less run-up; gentle ramps need more.
-            // Weight vertical vs forward boost by alignment and current speed.
-            let vz0 = ramp.strengthZ * (0.55 + 0.45*spdFrac) * align
-            let fwdBoost = min(420, max(0, 0.22 * spd + 0.10 * vz0)) * align
+            let vz0 = ramp.strengthZ * max(0.72, (0.55 + 0.45*spdFrac)) * align
+            let fwdPush = (0.35 * spd + 0.18 * vz0) * align
+            let fwdBoost = min(600, max(0, fwdPush))
             
-            // Launch (no trajectory preview — removed by request)
-            car.applyRampImpulse(vzAdd: vz0, forwardBoost: fwdBoost, heading: carHeading)
+            car.applyRampImpulse(vzAdd: vz0, forwardBoost: fwdBoost, heading: ramp.heading)
+            return
+        }
+        
+        // Car ↔ Obstacle/Wall (damage), BUT NEVER from ramps or hills
+        let harmMask: UInt32 = (Category.obstacle | Category.wall)
+        let carA  = (bodyA.categoryBitMask & Category.car) != 0
+        let carB  = (bodyB.categoryBitMask & Category.car) != 0
+        let harmA = (bodyA.categoryBitMask & harmMask) != 0
+        let harmB = (bodyB.categoryBitMask & harmMask) != 0
+        
+        if (carA && harmB) || (carB && harmA) {
+            let carBody = carA ? bodyA : bodyB
+            let other   = carA ? bodyB : bodyA
+            
+            // ⛔ Never damage from ramps or hills
+            if isRamp(other) { return }
+            if isHill(other) { return }
+            
+            _hadSolidContactThisStep = true   // ← NEW: remember this step had a solid contact
+            (carBody.node as? CarNode)?.handleCrash(contact: contact, other: other)
             return
         }
     }
     
     // MARK: - Touches
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if controlsLockedForOverlay || pausedForDeath { return }   // NEW guard
         guard let cam = camera else { return }
         
         for t in touches {
@@ -603,7 +829,8 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
             
             if fireTouch == nil, pointInsideFireButton(pCam) {
                 fireTouch = t
-                startAutoFire()
+                car.startAutoFire(on: self)
+                animateFireTap()
                 continue
             }
             
@@ -629,6 +856,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     }
     
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if controlsLockedForOverlay || pausedForDeath { return }   // NEW guard
         guard let cam = camera else { return }
         
         if let dt = driveTouch, touches.contains(dt) {
@@ -655,10 +883,11 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     }
     
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if controlsLockedForOverlay || pausedForDeath { return }   // NEW guard
         for t in touches {
             if let ft = fireTouch, t === ft {
                 fireTouch = nil
-                stopAutoFire()
+                car.stopAutoFire()
             }
             if let dt = driveTouch, t === dt {
                 driveTouch = nil
@@ -732,15 +961,6 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         fireButton.addChild(fireIcon)
     }
     
-    private func placeFireButton() {
-        let margin: CGFloat = 20
-        let R: CGFloat = 40
-        fireButton.position = CGPoint(
-            x: -size.width * 0.5 + margin + R,
-            y: -size.height * 0.5 + margin + R
-        )
-    }
-    
     private func pointInsideFireButton(_ pCam: CGPoint) -> Bool {
         let local = CGPoint(x: pCam.x - fireButton.position.x, y: pCam.y - fireButton.position.y)
         return hypot(local.x, local.y) <= 44
@@ -762,81 +982,6 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         let up   = SKAction.scale(to: 1.00, duration: 0.08)
         fireButton.run(.sequence([down, up]), withKey: "press")
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
-    }
-    
-    @discardableResult
-    private func spawnBullet() -> SKNode {
-        let heading = car.zRotation + .pi/2
-        let fwd = CGVector(dx: cos(heading), dy: sin(heading))
-        let muzzleOffset: CGFloat = 26
-        let origin = CGPoint(x: car.position.x + fwd.dx * muzzleOffset,
-                             y: car.position.y + fwd.dy * muzzleOffset)
-        
-        let carVel = car.physicsBody?.velocity ?? .zero
-        let vel = CGVector(dx: carVel.dx + fwd.dx * bulletSpeed,
-                           dy: carVel.dy + fwd.dy * bulletSpeed)
-        
-        let bullet = SKShapeNode(circleOfRadius: 3.5)
-        bullet.name = "bullet"
-        bullet.fillColor = .white
-        bullet.strokeColor = UIColor.white.withAlphaComponent(0.25)
-        bullet.lineWidth = 0.8
-        bullet.glowWidth = 2.0
-        bullet.position = origin
-        
-        let pb = SKPhysicsBody(circleOfRadius: 3.5)
-        pb.isDynamic = true
-        pb.affectedByGravity = false
-        pb.allowsRotation = false
-        pb.linearDamping = 0
-        pb.friction = 0
-        
-        pb.categoryBitMask = Category.bullet
-        pb.contactTestBitMask = Category.obstacle
-        pb.collisionBitMask = Category.obstacle
-        pb.usesPreciseCollisionDetection = true
-        
-        pb.velocity = vel
-        bullet.physicsBody = pb
-        
-        addChild(bullet)
-        bullet.run(.sequence([.wait(forDuration: bulletLife), .removeFromParent()]))
-        return bullet
-    }
-    
-    private func fireOnceManual() {
-        let now = CACurrentMediaTime()
-        if now - lastManualShot < singleTapCooldown { return }
-        lastManualShot = now
-        _ = spawnBullet()
-        animateFireTap()
-    }
-    
-    private func startAutoFire() {
-        guard !firing else { return }
-        firing = true
-        
-        fireOnceManual()
-        
-        removeAction(forKey: autoArmKey)
-        let arm = SKAction.sequence([
-            .wait(forDuration: autoFireArmDelay),
-            .run { [weak self] in
-                guard let self, self.firing else { return }
-                let loop = SKAction.sequence([
-                    .wait(forDuration: self.autoFireInterval),
-                    .run { [weak self] in _ = self?.spawnBullet() }
-                ])
-                self.run(.repeatForever(loop), withKey: self.autoFireKey)
-            }
-        ])
-        run(arm, withKey: autoArmKey)
-    }
-    
-    private func stopAutoFire() {
-        firing = false
-        removeAction(forKey: autoArmKey)
-        removeAction(forKey: autoFireKey)
     }
     
     private func hash2(_ x: Int, _ y: Int, seed: UInt64) -> UInt64 {
@@ -1043,6 +1188,10 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         return !blocked
     }
     
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Make static/dynamic obstacles non-bouncy
+    // ─────────────────────────────────────────────────────────────────────────────
+    
     @discardableResult
     private func placeObstacleTracked(_ kind: ObstacleKind, at p: CGPoint, rotation: CGFloat = 0) -> SKNode? {
         if !worldBounds.insetBy(dx: obstacleEdgeMargin, dy: obstacleEdgeMargin).contains(p) { return nil }
@@ -1054,13 +1203,14 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         node.position = p
         node.zRotation = rotation
         node.zPosition = 1
+        
+        if let pb = node.physicsBody {
+            pb.restitution = 0         // ← NEW
+            pb.friction = 0            // ← NEW (already common, just enforce)
+            pb.usesPreciseCollisionDetection = true
+        }
         obstacleRoot.addChild(node)
         return node
-    }
-    
-    @discardableResult
-    private func placeObstacle(_ kind: ObstacleKind, at p: CGPoint, rotation: CGFloat = 0) -> Bool {
-        return placeObstacleTracked(kind, at: p, rotation: rotation) != nil
     }
     
     private func hasNeighborObstacle(near p: CGPoint, radius: CGFloat) -> Bool {
@@ -1083,7 +1233,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     func spawnHill(at center: CGPoint, size: CGSize, height: CGFloat) {
         let rect = CGRect(x: center.x - size.width/2, y: center.y - size.height/2,
                           width: size.width, height: size.height)
-        let hill = HillNode(rect: rect, height: height) // your UI
+        let hill = HillNode(rect: rect, height: height)
         hill.zPosition = 0.5
         addChild(hill)
         hills.append(hill)
@@ -1094,26 +1244,23 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     private func groundHeight(at p: CGPoint) -> CGFloat {
         var h: CGFloat = 0
         for hill in hills where hill.parent != nil {
-            // Use its local bounding rect as the ellipse.
             let f = hill.calculateAccumulatedFrame()
             let cx = f.midX, cy = f.midY
             let rx = max(1, f.width * 0.5)
             let ry = max(1, f.height * 0.5)
             
-            // Normalized radius inside ellipse
             let dx = (p.x - cx) / rx
             let dy = (p.y - cy) / ry
-            let r = sqrt(dx*dx + dy*dy) // 0 center ... 1 at edge
+            let r = sqrt(dx*dx + dy*dy)
             
             if r <= 1.05 {
-                // Flat inner top until r = inner; then smoothstep down to 0 at r = 1.
                 let inner: CGFloat = 0.35
                 let t: CGFloat
                 if r <= inner {
                     t = 0
                 } else {
                     let u = min(1, (r - inner) / max(0.0001, (1 - inner)))
-                    t = u*u*(3 - 2*u) // smoothstep
+                    t = u*u*(3 - 2*u)
                 }
                 let hh = hill.topHeight * (1 - t)
                 h = max(h, hh)
@@ -1123,7 +1270,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     }
     
     func spawnRamp(at center: CGPoint, size: CGSize, angleRadians: CGFloat, strengthZ: CGFloat = 850) {
-        let ramp = RampNode(center: center, size: size, heading: angleRadians, strengthZ: strengthZ) // your UI
+        let ramp = RampNode(center: center, size: size, heading: angleRadians, strengthZ: strengthZ)
         ramp.zPosition = 0.4
         obstacleRoot.addChild(ramp)
     }
@@ -1168,7 +1315,6 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         func dir(_ a: CGFloat) -> CGVector { .init(dx: cos(a), dy: sin(a)) }
         let baseHeading = atan2(center.y - worldCtr.y, center.x - worldCtr.x)
         
-        // Try a few headings around the "from outside to hill" direction
         let candidates: [CGFloat] = [
             baseHeading,
             baseHeading + (.pi/10),
@@ -1176,9 +1322,8 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
             rng.range(-.pi ... .pi)
         ]
         
-        // Ramp visuals tuned thinner
-        let rampWidthRange: ClosedRange<CGFloat>  = 64...88    // thinner wedge
-        let rampLengthRange: ClosedRange<CGFloat> = 110...160  // along heading
+        let rampWidthRange: ClosedRange<CGFloat>  = 64...88
+        let rampLengthRange: ClosedRange<CGFloat> = 110...160
         
         for heading in candidates {
             let d = dir(heading)
@@ -1239,7 +1384,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
             
             let rectHill = CGRect(x: c.x - sz.width/2, y: c.y - sz.height/2, width: sz.width, height: sz.height)
             let h = rng.range(90...180)
-            let hill = HillNode(rect: rectHill, height: h) // your UI
+            let hill = HillNode(rect: rectHill, height: h)
             hill.zPosition = 0.5
             addChild(hill)
             hills.append(hill)
@@ -1266,11 +1411,80 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         }
     }
     
+    // MARK: - Ramp pointer HUD (puck)
+    private func buildRampArrowHUD() {
+        rampArrow.zPosition = 600
+        
+        // Base puck (ring)
+        let R: CGFloat = 18
+        let ringRect = CGRect(x: -R, y: -R, width: 2*R, height: 2*R)
+        rampArrowBase.path = CGPath(ellipseIn: ringRect, transform: nil)
+        rampArrowBase.fillColor = UIColor(white: 0, alpha: 0.28)
+        rampArrowBase.strokeColor = UIColor.white.withAlphaComponent(0.22)
+        rampArrowBase.lineWidth = 1.5
+        rampArrowBase.glowWidth = 2
+        rampArrow.addChild(rampArrowBase)
+        
+        // Pulse halo
+        let haloR: CGFloat = R + 6
+        rampArrowPulse.path = CGPath(ellipseIn: CGRect(x: -haloR, y: -haloR, width: 2*haloR, height: 2*haloR), transform: nil)
+        rampArrowPulse.strokeColor = UIColor.systemTeal.withAlphaComponent(0.55)
+        rampArrowPulse.fillColor = .clear
+        rampArrowPulse.lineWidth = 3
+        rampArrowPulse.glowWidth = 4
+        rampArrow.addChild(rampArrowPulse)
+        let pulseUp = SKAction.group([.scale(to: 1.08, duration: 0.6), .fadeAlpha(to: 0.25, duration: 0.6)])
+        let pulseDn = SKAction.group([.scale(to: 1.00, duration: 0.6), .fadeAlpha(to: 0.55, duration: 0.6)])
+        rampArrowPulse.run(.repeatForever(.sequence([pulseUp, pulseDn])))
+        
+        // Arrow head (points along +Y in local space) inside the puck
+        let padding: CGFloat = 3.0
+        let innerR = R - padding
+        let tipY: CGFloat = innerR - 0.5
+        let baseY: CGFloat = innerR - 8.0
+        let w: CGFloat = 10.0
+        
+        let tri = CGMutablePath()
+        tri.move(to: CGPoint(x: 0, y: tipY))
+        tri.addLine(to: CGPoint(x:  w * 0.5, y: baseY))
+        tri.addLine(to: CGPoint(x: -w * 0.5, y: baseY))
+        tri.closeSubpath()
+        rampArrowHead.path = tri
+        rampArrowHead.fillColor = .black
+        rampArrowHead.strokeColor = UIColor.white.withAlphaComponent(0.25)
+        rampArrowHead.lineWidth = 1
+        rampArrow.addChild(rampArrowHead)
+    }
+    
+    // Flip placement by chosen hand
+    private func placeFireButton() {
+        let margin: CGFloat = 20
+        let R: CGFloat = 40
+        let x = isLeftHanded
+        ? (-size.width * 0.5 + margin + R)
+        : ( size.width * 0.5 - margin - R)
+        fireButton.position = CGPoint(x: x, y: -size.height * 0.5 + margin + R)
+    }
+    
     // MARK: - Update
     override func update(_ currentTime: TimeInterval) {
         let raw = (lastUpdate == 0) ? 0 : (currentTime - lastUpdate)
         lastUpdate = currentTime
         let dt = CGFloat(min(max(raw, 0), 0.05))
+        
+        // Freeze camera hard while dead; unfreeze on respawn
+        if let freeze = cameraFrozenPos {
+            camera?.removeAllActions()
+            camera?.position = freeze
+            if car.isDead {
+                return
+            } else {
+                cameraFrozenPos = nil
+                resumeWorldAfterRespawn() // NEW
+                // fall through to normal update this frame
+            }
+        }
+        
         guard dt > 0 else {
             camera?.position = car.position
             return
@@ -1280,7 +1494,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         
         maybeUpdateObstacleStreaming(currentTime)
         
-        if isTouching, controlArmed, let f = fingerCam, let pb = car.physicsBody {
+        if !car.isDead, isTouching, controlArmed, let f = fingerCam, let pb = car.physicsBody {
             isCoasting = false
             
             let vFinger = CGVector(dx: f.x, dy: f.y)
@@ -1289,6 +1503,18 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
             let dClamped = CGFloat.clamp(dRaw, innerR, outerR)
             let angRaw   = atan2(vFinger.dy, vFinger.dx)
             
+            ringHandle.position = CGPoint(x: cos(angRaw) * dClamped, y: sin(angRaw) * dClamped)
+            
+            let tNormBase = (dClamped <= innerR + 1) ? 0 : (dClamped - innerR) / max(outerR - innerR, 1)
+            let tNorm = CGFloat.clamp(tNormBase, 0, 1)
+            let idx = max(0, min(4, Int(floor(tNorm * 5))))
+            setActiveBand(index: idx)
+            
+            if lockAngleUntilExitDeadzone, dRaw > innerR + 4 {
+                lockAngleUntilExitDeadzone = false
+            }
+            
+            // === DRIVING LOGIC ===
             let tau: CGFloat = 0.06
             let alpha = CGFloat(1.0 - exp(-Double(dt / tau)))
             if !lockAngleUntilExitDeadzone, dRaw > innerR + 4 {
@@ -1313,8 +1539,6 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
             let v   = pb.velocity
             let fwdMag = v.dx * fwd.dx + v.dy * fwd.dy
             
-            let tNormBase = (dClamped <= innerR + 1) ? 0 : (dClamped - innerR) / max(outerR - innerR, 1)
-            let tNorm = CGFloat.clamp(tNormBase, 0, 1)
             let baseTarget = tNorm * car.maxSpeed
             
             let overshootEps: CGFloat = 6
@@ -1349,8 +1573,9 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
                 
                 car.throttle = CGFloat.clamp(throttleCmd, 0, 1)
             }
+            // === END DRIVING LOGIC ===
             
-        } else if isCoasting {
+        } else if isCoasting && !car.isDead {
             let speed = car.physicsBody?.velocity.length ?? 0
             if speed < 8 {
                 car.throttle = 0
@@ -1373,9 +1598,15 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         
         // Keep the vertical axis in sync with terrain (smooth hill profile)
         let gh = groundHeight(at: car.position)
+        applyHillModifiers(gh: gh)
         car.stepVertical(dt: dt, groundHeight: gh)
         
         car.update(dt)
+        
+        car.update(dt)
+        
+        _preCarVel = car.physicsBody?.velocity ?? .zero   // ← NEW
+        _lastDTForClamp = dt
         
         let ptsPerSec = car.physicsBody?.velocity.length ?? 0
         let kmh = ptsPerSec * kmhPerPointPerSecond
@@ -1385,36 +1616,68 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         let desiredHeading = (hasAngleLP ? angleLP : actualHeading)
         updateHeadingHUD(desired: desiredHeading, actual: actualHeading)
         
+        updateRampPointer()
         cullBulletsOutsideWorld()
     }
     
-    // MARK: - Spawn helpers
-    private func safeSpawnPoint(in rect: CGRect, radius: CGFloat, attempts: Int = 128) -> CGPoint {
-        var inner = rect.insetBy(dx: radius, dy: radius)
-        if inner.width <= 1 || inner.height <= 1 { inner = rect }
-        
-        let minX = Swift.min(inner.minX, inner.maxX)
-        let maxX = Swift.max(inner.minX, inner.maxX)
-        let minY = Swift.min(inner.minY, inner.maxY)
-        let maxY = Swift.max(inner.minY, inner.maxY)
-        
-        for _ in 0..<attempts {
-            let p = CGPoint(x: .random(in: minX...maxX), y: .random(in: minY...maxY))
-            if !isBlocked(at: p, radius: radius) { return p }
-        }
-        return CGPoint(x: rect.midX, y: rect.midY)
+    // GameScene.swift — helpers (add anywhere in GameScene)
+    @inline(__always)
+    private func groundGradientMagnitude(at p: CGPoint) -> CGFloat {
+        // Finite differences on your groundHeight() field
+        let h: CGFloat = 8
+        let hx = groundHeight(at: CGPoint(x: p.x + h, y: p.y)) - groundHeight(at: CGPoint(x: p.x - h, y: p.y))
+        let hy = groundHeight(at: CGPoint(x: p.x, y: p.y + h)) - groundHeight(at: CGPoint(x: p.x, y: p.y - h))
+        // height per point; scale to a convenient range
+        return 0.5 * sqrt(hx*hx + hy*hy)
     }
     
-    private func isBlocked(at p: CGPoint, radius: CGFloat) -> Bool {
-        var blocked = false
-        let r = CGRect(x: p.x - radius, y: p.y - radius, width: radius*2, height: radius*2)
-        physicsWorld.enumerateBodies(in: r) { [weak self] body, stop in
-            guard let self else { return }
-            if (body.categoryBitMask & blockedMask) != 0 {
-                blocked = true; stop.pointee = true
-            }
+    private func applyHillModifiers(gh: CGFloat) {
+        // Treat tiny residual heights at the base as flat → no penalties
+        if gh < 16 {
+            car.hillSpeedMul = 1
+            car.hillAccelMul = 1
+            car.hillDragK    = 0
+            return
         }
-        return blocked
+        
+        let gvec = groundGradient(at: car.position)           // ∇h (uphill)
+        let gmag = hypot(gvec.dx, gvec.dy) * 0.5              // same scale as groundGradientMagnitude
+        let slope = min(1, gmag / 28.0)                       // 0 on flat → 1 on steep rim
+        
+        // Forward / downhill alignment
+        let heading = car.zRotation + .pi/2
+        let fwd = CGVector(dx: cos(heading), dy: sin(heading))
+        var down = CGVector(dx: -gvec.dx, dy: -gvec.dy)       // downhill
+        let dLen = max(1e-6, hypot(down.dx, down.dy))
+        down.dx /= dLen; down.dy /= dLen
+        let alignDown = max(0, fwd.dx * down.dx + fwd.dy * down.dy)   // 0…1
+        
+        // Base hill penalties are now gentler
+        var speedMul = 0.85 - 0.20 * slope                     // 0.65…0.85 (was 0.35…0.58)
+        var accelMul = 0.95 - 0.45 * slope                     // 0.50…0.95 (was 0.50…0.75)
+        var dragK    = 0.6  + 1.4  * slope                     // lighter extra drag
+        
+        // Downhill assist: reduce penalties and add "free" acceleration down the slope
+        // (implemented by raising accelMul toward/above 1 when aligned downhill)
+        let assist = alignDown * slope                         // 0…1 only if pointing downhill
+        speedMul = min(1.00, speedMul + 0.22 * assist)         // loosen cap when rolling down
+        accelMul = min(1.20, accelMul + 0.55 * assist)         // push down the hill
+        dragK    = max(0.0, dragK * (1.0 - 0.55 * assist))     // less drag when going with gravity
+        
+        car.hillSpeedMul = speedMul
+        car.hillAccelMul = accelMul
+        car.hillDragK    = dragK
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Vector version: uphill gradient (∇h). Downhill is the negative of this.
+    // ─────────────────────────────────────────────────────────────────────────────
+    @inline(__always)
+    func groundGradient(at p: CGPoint) -> CGVector {
+        let h: CGFloat = 8
+        let hx = groundHeight(at: CGPoint(x: p.x + h, y: p.y)) - groundHeight(at: CGPoint(x: p.x - h, y: p.y))
+        let hy = groundHeight(at: CGPoint(x: p.x, y: p.y + h)) - groundHeight(at: CGPoint(x: p.x, y: p.y - h))
+        return CGVector(dx: 0.5 * hx, dy: 0.5 * hy)   // height per point (matches magnitude helper)
     }
 }
 
@@ -1556,6 +1819,7 @@ extension GameScene {
     
     func shakeCamera(intensity: CGFloat, duration: TimeInterval) {
         guard let cam = camera else { return }
+        if strictCentering { return }   // never offset the view from the car
         cam.removeAction(forKey: "shake")
         let frames = max(2, Int(ceil(duration / 0.02)))
         var seq: [SKAction] = []
@@ -1568,4 +1832,136 @@ extension GameScene {
         seq.append(.moveTo(y: car.position.y, duration: 0.00))
         cam.run(.sequence(seq), withKey: "shake")
     }
+    
+    // GameScene.swift — spawn safety helpers + safeSpawnPoint(in:radius:)
+    @inline(__always)
+    private func circleIntersectsRect(center: CGPoint, radius: CGFloat, rect: CGRect) -> Bool {
+        let nx = max(rect.minX, min(center.x, rect.maxX))
+        let ny = max(rect.minY, min(center.y, rect.maxY))
+        let dx = center.x - nx
+        let dy = center.y - ny
+        return (dx*dx + dy*dy) <= radius*radius
+    }
+    
+    // Any node that should block spawning now or in the future.
+    @inline(__always)
+    private func nodeBlocksSpawn(_ n: SKNode) -> Bool {
+        if n is HillNode { return true }
+        if n is RampNode { return true }
+        if let ud = n.userData, ud["spawnBlocks"] as? Bool == true { return true }
+        if let name = n.name?.lowercased(), name.contains("enhancement") || name.contains("powerup") { return true }
+        return false
+    }
+    
+    private func isBlocked(at p: CGPoint, radius: CGFloat) -> Bool {
+        // Physics bodies that must not overlap spawns
+        let area = CGRect(x: p.x - radius, y: p.y - radius, width: radius*2, height: radius*2)
+        let physicsMask: UInt32 = (Category.wall | Category.obstacle | Category.hole | Category.ramp | Category.car)
+        
+        var blockedByPhysics = false
+        physicsWorld.enumerateBodies(in: area) { body, stop in
+            if (body.categoryBitMask & physicsMask) != 0 {
+                blockedByPhysics = true; stop.pointee = true
+            }
+        }
+        if blockedByPhysics { return true }
+        
+        // Hills (often non-physics)
+        for hill in hills where hill.parent != nil {
+            let fr = hill.calculateAccumulatedFrame()
+            if circleIntersectsRect(center: p, radius: radius, rect: fr) { return true }
+        }
+        
+        // Ramps + future enhancements/powerups hosted under obstacleRoot
+        for n in obstacleRoot.children where nodeBlocksSpawn(n) {
+            let fr = n.calculateAccumulatedFrame()
+            if circleIntersectsRect(center: p, radius: radius, rect: fr) { return true }
+        }
+        
+        // Keep away from world edges
+        if !worldBounds.insetBy(dx: radius, dy: radius).contains(p) { return true }
+        
+        return false
+    }
+    
+    private func safeSpawnPoint(in rect: CGRect, radius: CGFloat, attempts: Int = 128) -> CGPoint {
+        var inner = rect.intersection(worldBounds).insetBy(dx: radius, dy: radius)
+        if inner.isNull || inner.width < 2 || inner.height < 2 {
+            inner = rect.insetBy(dx: radius, dy: radius)
+        }
+        
+        let minX = min(inner.minX, inner.maxX)
+        let maxX = max(inner.minX, inner.maxX)
+        let minY = min(inner.minY, inner.maxY)
+        let maxY = max(inner.minY, inner.maxY)
+        
+        // Random sampling
+        for _ in 0..<attempts {
+            let p = CGPoint(x: .random(in: minX...maxX), y: .random(in: minY...maxY))
+            if !isBlocked(at: p, radius: radius) { return p }
+        }
+        
+        // Grid fallback
+        let step = max(16, radius * 0.8)
+        let cols = max(1, Int(ceil(inner.width  / step)))
+        let rows = max(1, Int(ceil(inner.height / step)))
+        let cx = inner.midX, cy = inner.midY
+        var candidates: [CGPoint] = []
+        for j in 0...rows {
+            for i in 0...cols {
+                let x = inner.minX + CGFloat(i) * step
+                let y = inner.minY + CGFloat(j) * step
+                candidates.append(CGPoint(x: x, y: y))
+            }
+        }
+        candidates.sort {
+            let da = hypot($0.x - cx, $0.y - cy)
+            let db = hypot($1.x - cx, $1.y - cy)
+            return da < db
+        }
+        for p in candidates {
+            if !isBlocked(at: p, radius: radius) { return p }
+        }
+        
+        // Expand rings
+        var expand: CGFloat = radius * 1.5
+        for _ in 0..<6 {
+            let expanded = inner.insetBy(dx: -expand, dy: -expand).intersection(worldBounds)
+            if expanded.isNull || expanded.width < 2 || expanded.height < 2 {
+                expand += radius; continue
+            }
+            let cols2 = max(1, Int(ceil(expanded.width  / step)))
+            let rows2 = max(1, Int(ceil(expanded.height / step)))
+            for j in 0...rows2 {
+                for i in 0...cols2 {
+                    let x = expanded.minX + CGFloat(i) * step
+                    let y = expanded.minY + CGFloat(j) * step
+                    let p = CGPoint(x: x, y: y)
+                    if !isBlocked(at: p, radius: radius) { return p }
+                }
+            }
+            expand += radius
+        }
+        
+        return CGPoint(x: rect.midX, y: rect.midY)
+    }
 }
+
+// MARK: - CarNodeDelegate
+extension GameScene: CarNodeDelegate {
+    func carNodeDidExplode(_ car: CarNode, at position: CGPoint) {
+        spawnDestructionFX(at: position, for: .steel)
+        shakeCamera(intensity: 6, duration: 0.20)
+        
+        // HARD FREEZE the camera until respawn + pause world
+        cameraFrozenPos = position
+        camera?.removeAllActions()
+        camera?.position = position
+        pauseWorldForDeath()     // NEW
+    }
+    func carNodeRequestRespawnPoint(_ car: CarNode) -> CGPoint {
+        let search = cameraWorldRect(margin: 400).insetBy(dx: 120, dy: 120)
+        return safeSpawnPoint(in: search, radius: spawnClearance)
+    }
+}
+

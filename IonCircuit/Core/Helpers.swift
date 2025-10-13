@@ -42,8 +42,30 @@ extension CGFloat {
     static func lerp(_ a: CGFloat, _ b: CGFloat, _ t: CGFloat) -> CGFloat { a + (b - a) * t }
     
     static func random(in range: ClosedRange<CGFloat>) -> CGFloat {
-        let r = CGFloat(Double.random(in: Double(range.lowerBound)...Double(range.upperBound)))
-        return r
+        var lo = range.lowerBound
+        var hi = range.upperBound
+        
+        // Normalize order
+        if lo > hi { swap(&lo, &hi) }
+        
+        // Fast exits
+        if lo == hi { return lo }
+        if lo.isNaN || hi.isNaN { return 0 } // safe fallback
+        
+        // Clamp any non-finite bounds to a practical finite window
+        let clamp: CGFloat = 1_000_000 // adjust to your world scale if desired
+        func finite(_ x: CGFloat) -> CGFloat {
+            if x.isFinite { return Swift.max(-clamp, Swift.min(x, clamp)) }
+            return x < 0 ? -clamp : clamp
+        }
+        lo = finite(lo)
+        hi = finite(hi)
+        if lo > hi { swap(&lo, &hi) }
+        if lo == hi { return lo }
+        
+        // Sample [0,1] (always finite), then lerp
+        let u = CGFloat(Double.random(in: 0.0...1.0))
+        return lo + (hi - lo) * u
     }
 }
 
