@@ -7,6 +7,8 @@
 
 import Foundation
 internal import CoreGraphics
+import UIKit
+import SpriteKit
 
 // ===== Helpers (file-scope) =====
 @inline(__always)
@@ -73,3 +75,55 @@ extension CGPoint {
     func distance(to p: CGPoint) -> CGFloat { hypot(x - p.x, y - p.y) }
 }
 
+extension UIColor {
+    func withHueOffset(_ d: CGFloat, satMul: CGFloat, briMul: CGFloat) -> UIColor {
+        var h: CGFloat = 0, s: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        if getHue(&h, saturation: &s, brightness: &b, alpha: &a) {
+            var nh = h + d
+            if nh < 0 { nh += 1 } else if nh > 1 { nh -= 1 }
+            return UIColor(hue: nh, saturation: max(0, min(1, s * satMul)), brightness: max(0, min(1, b * briMul)), alpha: a)
+        }
+        return self
+    }
+}
+
+// --- Shape glow/blur compatibility ---
+// Some code bases try: shape.filter = CIFilter(...); shape.shouldEnableEffects = true
+// On iOS you must wrap the shape in an SKEffectNode instead.
+public extension SKShapeNode {
+    /// Returns a node that renders this shape through a CIFilter.
+    /// The original shape is re-parented under an SKEffectNode.
+    @discardableResult
+    func wrappedInEffect(filter: CIFilter, rasterize: Bool = true) -> SKEffectNode {
+        let effect = SKEffectNode()
+        effect.shouldRasterize = rasterize
+        effect.filter = filter
+
+        // Keep visual stacking identical to the original
+        effect.zPosition = zPosition
+        effect.position  = position
+        effect.zRotation = zRotation
+        effect.setScale(xScale)
+        effect.alpha     = alpha
+
+        // Move self under the effect node
+        removeFromParent()
+        effect.addChild(self)
+
+        // Reset transform on the child so the effect node owns it
+        self.position = .zero
+        self.zRotation = 0
+        self.setScale(1)
+        self.alpha = 1
+        return effect
+    }
+
+    /// Convenience specifically for a Gaussian blur "glow".
+    @discardableResult
+    func wrappedInGlow(blurRadius: CGFloat) -> SKEffectNode {
+        let r = max(0, blurRadius)
+        let f = CIFilter(name: "CIGaussianBlur")!
+        f.setValue(r, forKey: kCIInputRadiusKey)
+        return wrappedInEffect(filter: f)
+    }
+}

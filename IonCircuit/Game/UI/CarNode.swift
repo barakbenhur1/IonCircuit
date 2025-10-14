@@ -9,33 +9,45 @@ import SpriteKit
 import UIKit
 import ObjectiveC
 
-// Delegates back to the scene for FX & spawn logic.
+// MARK: - Scene callbacks
 protocol CarNodeDelegate: AnyObject {
     func carNodeDidExplode(_ car: CarNode, at position: CGPoint)
     func carNodeRequestRespawnPoint(_ car: CarNode) -> CGPoint
+    // NEW: called when the car has no lives left
+    func carNodeDidRunOutOfLives(_ car: CarNode)
 }
 
+// Optional HUD hooks; the scene may implement these.
+@objc protocol CarShieldReporting { @objc optional func onShieldChanged(_ value: Int) }
+@objc protocol CarWeaponReporting { @objc optional func onWeaponChanged(_ name: String) }
+@objc protocol CarStatusReporting {
+    @objc optional func onControlBoostChanged(_ active: Bool)
+    @objc optional func onMiniModeChanged(_ active: Bool)
+}
+
+// GameScene calls this on death to clear everything.
+@objc protocol CarEnhancementResetting { func resetEnhancements() }
+
+private struct LivesCB { static var cb = 0 }
+
+// MARK: - CarNode
 final class CarNode: SKNode {
+    
     private enum Assoc {
-        static var g: UInt8 = 0
-        static var z: UInt8 = 0
-        static var v: UInt8 = 0
-        static var a: UInt8 = 0
-        static var m: UInt8 = 0
-        static var s: UInt8 = 0
-        static var combat = 0
+        static var g: UInt8 = 0, z: UInt8 = 0, v: UInt8 = 0, a: UInt8 = 0
+        static var m: UInt8 = 0, s: UInt8 = 0
         static var delegate = 0
     }
     
     // ---- Tuning ----
-    var acceleration: CGFloat = 540.0      // was 560
-    var maxSpeed: CGFloat     = 1520.0     // was 900
+    var acceleration: CGFloat = 540.0
+    var maxSpeed: CGFloat     = 1520.0
     var reverseSpeedFactor: CGFloat = 0.55
-    var turnRate: CGFloat     = 4.2
-    var traction: CGFloat     = 12.0
+    var turnRate: CGFloat     = 4.2          // used for control boost
+    var traction: CGFloat     = 12.0         // used for control boost
     var drag: CGFloat         = 1.0
     var brakeForce: CGFloat   = 1300.0
-    var speedCapBonus: CGFloat = 0   // forward-only extra cap, controlled by GameScene
+    var speedCapBonus: CGFloat = 0
     
     // Controls [-1, 1]
     var throttle: CGFloat = 0
@@ -51,8 +63,8 @@ final class CarNode: SKNode {
     private var exhaustL: SKEmitterNode!
     private var exhaustR: SKEmitterNode!
     
-    private var exhaustMixLP: CGFloat = 0            // smoothed 0…1 intensity
-    private let exhaustFadeTau: CGFloat = 0.35       // fade time constant (s)
+    private var exhaustMixLP: CGFloat = 0
+    private let exhaustFadeTau: CGFloat = 0.35
     
     // Palette
     private let bodyColor  = UIColor(hue: 0.58, saturation: 0.60, brightness: 0.98, alpha: 1)
@@ -62,17 +74,21 @@ final class CarNode: SKNode {
     private let tireColor  = UIColor(white: 0.15, alpha: 1)
     
     // MARK: Air / launch tuning
-    private let airDragCoef: CGFloat = 1.8     // per-second horizontal drag while airborne
-    private let launchLossMax: CGFloat = 0.60  // cap the immediate speed loss on takeoff
+    private let airDragCoef: CGFloat = 1.8
+    private let launchLossMax: CGFloat = 0.60
+    
+    var onLivesChanged: ((Int, Int) -> Void)? {
+        get { objc_getAssociatedObject(self, &LivesCB.cb) as? (Int, Int) -> Void }
+        set { objc_setAssociatedObject(self, &LivesCB.cb, newValue, .OBJC_ASSOCIATION_COPY_NONATOMIC) }
+    }
     
     // MARK: - Init
     override init() {
         super.init()
         
-        // ---- Geometry (face +Y = front) ----
-        // Slightly bigger model, same proportions (~+14%)
-        let W: CGFloat = 32        // was 28
-        let H: CGFloat = 41        // was 36
+        // ---- Geometry (face +Y = front)
+        let W: CGFloat = 32
+        let H: CGFloat = 41
         let noseY  =  H * 0.50
         let neckY  =  H * 0.18
         let midY   = -H * 0.15
@@ -90,6 +106,7 @@ final class CarNode: SKNode {
         p.addLine(to: CGPoint(x: -halfRearW, y: tailY))
         p.addLine(to: CGPoint(x: -halfRearW, y: midY))
         p.addLine(to: CGPoint(x: -halfNeckW, y: neckY))
+        self.baseChassisPath = p.copy()!
         p.closeSubpath()
         
         let chassis = SKShapeNode(path: p)
@@ -108,7 +125,7 @@ final class CarNode: SKNode {
         shadow.zPosition = 0
         addChild(shadow)
         
-        // Wheels (narrower & tucked in)
+        // Wheels
         func wheel(_ pos: CGPoint, _ rot: CGFloat) -> SKShapeNode {
             let w = SKShapeNode(rectOf: CGSize(width: 6, height: 16), cornerRadius: 2)
             w.fillColor = tireColor
@@ -187,11 +204,10 @@ final class CarNode: SKNode {
         [headL, headR, tailL, tailR].forEach(addChild)
         
         // ---- Exhaust emitters (left/right) ----
-        let flameTex = Self.makeFlameTextureMedium()          // medium size (a bit smaller than “old big”)
+        let flameTex = Self.makeFlameTextureMedium()
         exhaustL = Self.makeExhaustEmitter(texture: flameTex)
         exhaustR = Self.makeExhaustEmitter(texture: flameTex)
         
-        // Place slightly behind the tail, near the corners
         let exX = W * 0.22
         let exY = tailY - 2.0
         exhaustL.position = CGPoint(x: -exX, y: exY)
@@ -203,7 +219,7 @@ final class CarNode: SKNode {
         let pb = SKPhysicsBody(polygonFrom: p)
         pb.restitution = 0
         pb.isDynamic = true
-        pb.allowsRotation = false              // heading controlled kinematically
+        pb.allowsRotation = false
         pb.friction = 0.0
         pb.linearDamping = drag
         pb.angularDamping = 2.0
@@ -219,116 +235,10 @@ final class CarNode: SKNode {
     }
     
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-    
-    // NOTE: requires on CarNode:
-    // var speedCapBonus: CGFloat = 0     // scene can raise the forward cap temporarily
-    // var isAirborne: Bool               // you already have this with your vertical model
-    
-    func update(_ dt: CGFloat) {
-        guard let pb = physicsBody else { return }
-        
-        let heading = zRotation + .pi/2
-        let fwd     = CGVector(dx: cos(heading),  dy: sin(heading))
-        let right   = CGVector(dx: -sin(heading), dy: cos(heading))
-        
-        // ───────────────────────────
-        // AIRBORNE
-        // ───────────────────────────
-        if isAirborne {
-            let retain = exp(-dt * 2.3)
-            var vv = pb.velocity
-            vv.dx *= retain
-            vv.dy *= retain
-            
-            let airCap = (maxSpeed + max(0, speedCapBonus)) * 0.78
-            let sp = hypot(vv.dx, vv.dy)
-            if sp > airCap {
-                let k = airCap / max(sp, 0.001)
-                vv.dx *= k; vv.dy *= k
-            }
-            pb.velocity = vv
-            
-            let yaw = steer.clamped(-1, 1) * (turnRate * 0.35)
-            zRotation += yaw * dt
-            pb.angularVelocity = 0
-            
-            let fwdMag  = vv.dx * fwd.dx + vv.dy * fwd.dy
-            updateExhaust(speed: sp, fwdMag: fwdMag, dt: dt)
-            return
-        }
-        
-        // ───────────────────────────
-        // GROUND
-        // ───────────────────────────
-        var v      = pb.velocity
-        let fwdMag = v.dx * fwd.dx + v.dy * fwd.dy
-        let latMag = v.dx * right.dx + v.dy * right.dy
-        
-        // Kill lateral slip
-        let latKill = 1 - exp(-dt * traction * 4.0)
-        v.dx -= right.dx * latMag * latKill
-        v.dy -= right.dy * latMag * latKill
-        pb.velocity = v
-        
-        // Extra hill drag (rolling resistance on hills)
-        if hillDragK > 0 {
-            let keep = exp(-dt * hillDragK)
-            var vv = pb.velocity
-            vv.dx *= keep
-            vv.dy *= keep
-            pb.velocity = vv
-        }
-        
-        // Parking brake when no input
-        if abs(throttle) < 0.001 && abs(steer) < 0.001 {
-            let lin = exp(-dt * 14.0)
-            var vv = pb.velocity
-            vv.dx *= lin; vv.dy *= lin
-            if hypot(vv.dx, vv.dy) < 1.0 { vv = .zero }
-            pb.velocity = vv
-            pb.angularVelocity = 0
-            updateExhaust(speed: 0, fwdMag: 0, dt: dt)
-            return
-        }
-        
-        // Power
-        let input = throttle.clamped(-1, 1)
-        let opposes = (input > 0 && fwdMag < 0) || (input < 0 && fwdMag > 0)
-        if opposes {
-            let sign: CGFloat = fwdMag >= 0 ? 1 : -1
-            pb.applyForce(fwd.scaled(-sign * brakeForce))
-        } else {
-            pb.applyForce(fwd.scaled(input * acceleration * max(0, hillAccelMul)))
-        }
-        
-        // Speed cap (with hill multiplier)
-        let capForwardBase = maxSpeed + max(0, speedCapBonus)
-        let capForward     = capForwardBase * max(0.1, hillSpeedMul)
-        let cap = (fwdMag >= 0 ? capForward : maxSpeed * reverseSpeedFactor)
-        let speed = hypot(pb.velocity.dx, pb.velocity.dy)
-        if speed > cap {
-            let s = cap / max(speed, 0.001)
-            pb.velocity = CGVector(dx: pb.velocity.dx * s, dy: pb.velocity.dy * s)
-        }
-        
-        // Steering
-        let speedScale = 0.50 + 0.50 * CGFloat.clamp(abs(fwdMag) / 240.0, 0, 1)
-        let slowAssist = 1.0 + CGFloat.clamp(80 - abs(fwdMag), 0, 80) / 90.0
-        let commandedYaw = steer.clamped(-1, 1) * turnRate * speedScale * slowAssist
-        let maxYaw: CGFloat = 4.0
-        let yaw = CGFloat.clamp(commandedYaw, -maxYaw, maxYaw)
-        
-        zRotation += yaw * dt
-        pb.angularVelocity = 0
-        
-        updateExhaust(speed: hypot(pb.velocity.dx, pb.velocity.dy),
-                      fwdMag: fwdMag, dt: dt)
-    }
-    
-    // MARK: - Exhaust helpers
-    
-    // Medium flame texture (~30px): looks like the previous large size
-    // but trimmed a little; device-independent.
+}
+
+// MARK: - Exhaust helpers
+extension CarNode {
     private static func makeFlameTextureMedium() -> SKTexture {
         let px: CGFloat = 30
         let size = CGSize(width: px, height: px)
@@ -353,72 +263,52 @@ final class CarNode: SKNode {
     private static func makeExhaustEmitter(texture: SKTexture) -> SKEmitterNode {
         let e = SKEmitterNode()
         e.particleTexture = texture
-        
-        // Start off; we drive birthRate dynamically
         e.particleBirthRate = 0
         e.particleLifetime = 0.20
         e.particleLifetimeRange = 0.05
-        
         e.particleSpeed = 140
         e.particleSpeedRange = 50
-        
         e.particlePositionRange = CGVector(dx: 2.0, dy: 0)
         e.particleAlpha = 0.85
         e.particleAlphaSpeed = -2.6
-        
-        // Slightly bigger than the previous “too small”, still smaller than original big
         e.particleScale = 0.18
         e.particleScaleRange = 0.08
         e.particleScaleSpeed = 0.45
-        
         e.particleRotation = 0
         e.particleRotationSpeed = 2
-        
-        let colors: [UIColor] = [
-            .white,
-            .orange,
-            UIColor(red: 1.0, green: 0.35, blue: 0.0, alpha: 1.0),
-            UIColor(red: 1.0, green: 0.10, blue: 0.0, alpha: 0.0)
-        ]
+        let colors: [UIColor] = [.white, .orange,
+                                 UIColor(red: 1, green: 0.35, blue: 0, alpha: 1),
+                                 UIColor(red: 1, green: 0.10, blue: 0, alpha: 0)]
         let times: [NSNumber] = [0.0, 0.3, 0.7, 1.0]
         e.particleColorSequence = SKKeyframeSequence(keyframeValues: colors, times: times)
-        
         e.particleBlendMode = .add
-        e.emissionAngle = -CGFloat.pi/2                 // back of car (local -Y)
+        e.emissionAngle = -CGFloat.pi/2
         e.emissionAngleRange = CGFloat.pi/18
         e.zPosition = 1.5
         return e
     }
     
     private func updateExhaust(speed: CGFloat, fwdMag: CGFloat, dt: CGFloat) {
-        // Compute a *target* intensity (0…1) from speed/throttle
         let moving = speed > 2.0 || throttle > 0.02
         let speedNorm = CGFloat.clamp(speed / max(maxSpeed, 1), 0, 1)
         let throttleBoost = max(0, throttle)
         let targetMix: CGFloat = moving ? (0.35 * speedNorm + 0.65 * throttleBoost) : 0.0
         
-        // Low-pass filter → gradual fade when targetMix goes to 0
-        let a = 1 - exp(-Double(dt / max(exhaustFadeTau, 0.001)))   // 0…1
+        let a = 1 - exp(-Double(dt / max(exhaustFadeTau, 0.001)))
         exhaustMixLP += (targetMix - exhaustMixLP) * CGFloat(a)
         let mix = CGFloat.clamp(exhaustMixLP, 0, 1)
         
-        // Drive emitters from the smoothed mix
-        let maxBR: CGFloat = 320                      // 80 + 240 from before
+        let maxBR: CGFloat = 320
         let br = maxBR * mix
-        
         let basePS: CGFloat = 120
         let addPS:  CGFloat = 160
         let ps = basePS + addPS * mix
-        
         let scale = 0.16 + 0.22 * mix + 0.10 * (mix * mix)
-        
         let baseLT: CGFloat = 0.30
         let addLT:  CGFloat = 0.10
         let lt = baseLT + addLT * (mix * mix)
         let ltRange = lt * 0.15
-        
-        // Fade a bit slower at higher mix so trails read nicer
-        let alphaSpeed = -1.00 + 0.25 * mix          // -1.00 … -0.75
+        let alphaSpeed = -1.00 + 0.25 * mix
         
         [exhaustL, exhaustR].forEach { e in
             e.particleBirthRate = br
@@ -432,7 +322,7 @@ final class CarNode: SKNode {
     }
 }
 
-// MARK: - Air / Verticality for CarNode
+// MARK: - Air / Verticality
 extension CarNode {
     private struct LandAssoc { static var t = 0 }
     private var _lastLandingT: TimeInterval {
@@ -440,20 +330,54 @@ extension CarNode {
         set { objc_setAssociatedObject(self, &LandAssoc.t, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
     }
     
+    private struct LifeAssoc { static var max = 0, left = 0 }
+    var maxLives: Int {
+        get { (objc_getAssociatedObject(self, &LifeAssoc.max) as? Int) ?? 3 }
+        set {
+            let v = max(1, newValue)
+            objc_setAssociatedObject(self, &LifeAssoc.max, v, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+            if livesLeft > v { livesLeft = v }
+            onLivesChanged?(livesLeft, v)
+        }
+    }
+
+    var livesLeft: Int {
+        get { (objc_getAssociatedObject(self, &LifeAssoc.left) as? Int) ?? 3 }
+        set {
+            let v = max(0, newValue)
+            objc_setAssociatedObject(self, &LifeAssoc.left, v, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+            onLivesChanged?(v, maxLives)
+        }
+    }
+
+    func resetLives(_ to: Int? = nil) {
+        maxLives = to ?? maxLives
+        livesLeft = maxLives
+        onLivesChanged?(livesLeft, maxLives)
+    }
+    
     private struct GhostAssoc { static var g = 0 }
     private var _airGhosting: Bool {
         get { (objc_getAssociatedObject(self, &GhostAssoc.g) as? Bool) ?? false }
         set { objc_setAssociatedObject(self, &GhostAssoc.g, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
     }
-    // Public-ish tuning
-    var gravity: CGFloat { get { objc_getAssociatedObject(self, &Assoc.g) as? CGFloat ?? -1800 }
-        set { objc_setAssociatedObject(self, &Assoc.g, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) } }
-    var zLift: CGFloat { get { objc_getAssociatedObject(self, &Assoc.z) as? CGFloat ?? 0 }
-        set { objc_setAssociatedObject(self, &Assoc.z, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) } }
-    var vz: CGFloat { get { objc_getAssociatedObject(self, &Assoc.v) as? CGFloat ?? 0 }
-        set { objc_setAssociatedObject(self, &Assoc.v, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) } }
-    var isAirborne: Bool { get { objc_getAssociatedObject(self, &Assoc.a) as? Bool ?? false }
-        set { objc_setAssociatedObject(self, &Assoc.a, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) } }
+    
+    var gravity: CGFloat {
+        get { objc_getAssociatedObject(self, &Assoc.g) as? CGFloat ?? -1800 }
+        set { objc_setAssociatedObject(self, &Assoc.g, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
+    }
+    var zLift: CGFloat {
+        get { objc_getAssociatedObject(self, &Assoc.z) as? CGFloat ?? 0 }
+        set { objc_setAssociatedObject(self, &Assoc.z, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
+    }
+    var vz: CGFloat {
+        get { objc_getAssociatedObject(self, &Assoc.v) as? CGFloat ?? 0 }
+        set { objc_setAssociatedObject(self, &Assoc.v, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
+    }
+    var isAirborne: Bool {
+        get { objc_getAssociatedObject(self, &Assoc.a) as? Bool ?? false }
+        set { objc_setAssociatedObject(self, &Assoc.a, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
+    }
     
     private var _groundMask: UInt32 {
         get { objc_getAssociatedObject(self, &Assoc.m) as? UInt32 ?? (physicsBody?.collisionBitMask ?? 0) }
@@ -467,8 +391,6 @@ extension CarNode {
     /// Call once after the car is created (e.g. in GameScene.didMove)
     func enableAirPhysics() {
         _groundMask = physicsBody?.collisionBitMask ?? 0
-        
-        // soft oval shadow
         let sh = SKShapeNode(ellipseOf: CGSize(width: 44, height: 18))
         sh.fillColor = .black
         sh.strokeColor = .clear
@@ -495,7 +417,7 @@ extension CarNode {
             isAirborne = true
         }
         
-        // ── Altitude ghosting with hysteresis (unchanged behavior) ───────────────
+        // Altitude ghosting with hysteresis
         let clearance = zLift - groundHeight
         let ghostOn:  CGFloat = 14
         let ghostOff: CGFloat = 8
@@ -507,17 +429,14 @@ extension CarNode {
         }
         if let pb = physicsBody { pb.collisionBitMask = _airGhosting ? 0 : _groundMask }
         
-        // ── Landing energy handling (soft at hill base / downhill) ───────────────
+        // Landing energy handling
         if wasAir && !isAirborne, let pb = physicsBody {
-            // Tiny residual height near the base? Don’t nuke speed there.
             if groundHeight < 16 {
-                // Very gentle settle only
                 let keep = exp(-dt * 2.0)
                 var v = pb.velocity
                 v.dx *= keep; v.dy *= keep
                 pb.velocity = v
             } else {
-                // Scale retention by impact AND by downhill alignment
                 let heading = zRotation + .pi/2
                 let f = CGVector(dx: cos(heading),  dy: sin(heading))
                 let s = CGVector(dx: -f.dy,         dy: f.dx)
@@ -525,7 +444,7 @@ extension CarNode {
                 let vf = v.dx * f.dx + v.dy * f.dy
                 let vs = v.dx * s.dx + v.dy * s.dy
                 
-                let impact = min(1, abs(vzAtLanding) / 1100)   // 0…1
+                let impact = min(1, abs(vzAtLanding) / 1100)
                 
                 var alignDown: CGFloat = 0
                 if let scn = scene as? GameScene {
@@ -533,15 +452,13 @@ extension CarNode {
                     var down = CGVector(dx: -g.dx, dy: -g.dy)
                     let len = max(1e-6, hypot(down.dx, down.dy))
                     down.dx /= len; down.dy /= len
-                    alignDown = max(0, f.dx * down.dx + f.dy * down.dy) // 0…1 if pointing downhill
+                    alignDown = max(0, f.dx * down.dx + f.dy * down.dy)
                 }
                 
-                // More retention when pointing downhill, less when uphill, never clamp to zero
-                let baseKeepF: CGFloat = 0.65 - 0.35 * impact       // 0.30…0.65
-                let boostF:    CGFloat = 0.35 * alignDown           // up to +0.35 when aligned downhill
+                let baseKeepF: CGFloat = 0.65 - 0.35 * impact
+                let boostF:    CGFloat = 0.35 * alignDown
                 let keepFwd = CGFloat.clamp(baseKeepF + boostF, 0.25, 0.95)
-                
-                let keepSide = max(0.28, 0.50 - 0.30 * impact)      // keep some lateral too
+                let keepSide = max(0.28, 0.50 - 0.30 * impact)
                 
                 let newV = CGVector(
                     dx: f.dx * (vf * keepFwd) + s.dx * (vs * keepSide),
@@ -550,7 +467,6 @@ extension CarNode {
                 pb.velocity = newV
             }
             
-            // Debounce repeated “mini-landings” on the base
             let now = CACurrentMediaTime()
             if now - _lastLandingT > 0.08 {
                 removeAction(forKey: "landPop")
@@ -562,25 +478,23 @@ extension CarNode {
         }
     }
     
-    /// `heading` is the ramp forward direction (same convention you already use).
+    /// `heading` is the ramp forward direction.
     func applyRampImpulse(vzAdd: CGFloat, forwardBoost: CGFloat, heading: CGFloat) {
         guard let pb = physicsBody else { return }
         isAirborne = true
         vz += vzAdd
-        _airGhosting = true            // ← NEW: start ghosted; hysteresis will turn it off when low
+        _airGhosting = true
         pb.collisionBitMask = 0
         speedCapBonus = 0
         
-        // Decompose current velocity into ramp axes
         let f = CGVector(dx: cos(heading), dy: sin(heading))      // ramp forward
         let s = CGVector(dx: -f.dy,          dy: f.dx)            // right
         let v = pb.velocity
         let vf = v.dx * f.dx + v.dy * f.dy
         let vs = v.dx * s.dx + v.dy * s.dy
         
-        // Immediate loss: keep some momentum but never a full carry-over.
         let steep = min(1.0, max(0.0, vzAdd / 1100.0))
-        let loss  = min(launchLossMax, 0.12 + 0.32 * steep)   // softer than before
+        let loss  = min(launchLossMax, 0.12 + 0.32 * steep)
         let newVf = max(0, vf * (1 - loss)) + forwardBoost
         let newVs = vs * (1 - loss * 0.25)
         
@@ -589,15 +503,19 @@ extension CarNode {
     }
 }
 
-// MARK: - Shooting (owned by CarNode)
+// MARK: - Shooting (uses BulletNode.ShotStyle API)
 extension CarNode {
     // Tuning
-    private var bulletSpeed: CGFloat { 2200 }
-    private var bulletLife:  CGFloat { 1.0 }
-    
-    private var singleTapCooldown: TimeInterval { 0.22 }
-    private var autoFireInterval:  TimeInterval { 0.24 }
-    private var autoFireArmDelay:  TimeInterval { 0.18 }
+    private var bulletSpeed: CGFloat { 1200 }   // world units / s
+    private var singleTapCooldown: TimeInterval {
+        switch weaponMod { case .rapid: return 0.12; default: return 0.22 }
+    }
+    private var autoFireInterval:  TimeInterval {
+        switch weaponMod { case .rapid: return 0.12; default: return 0.24 }
+    }
+    private var currentBulletDamage: Int {
+        switch weaponMod { case .damage: return 3; default: return 1 }
+    }
     private var muzzleOffset: CGFloat { 26 }
     
     // Keys & state
@@ -609,37 +527,65 @@ extension CarNode {
         set { objc_setAssociatedObject(self, &FireAssoc.last, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
     }
     
-    /// One bullet, respects a small cooldown.
+    private func currentShotStyle() -> ShotStyle {
+        switch weaponMod {
+        case .rapid:  return .rapid
+        case .damage: return .damage
+        case .spread: return .spread
+        case .none:   return .rapid
+        }
+    }
+    
+    func stopAutoFire() {
+        removeAction(forKey: fireArmKey)
+        removeAction(forKey: fireLoopKey)
+    }
+    
     func fireOnce(on scene: SKScene) {
         let now = CACurrentMediaTime()
         if now - _lastShot < singleTapCooldown { return }
         _lastShot = now
-        
+
         guard let pb = physicsBody else { return }
+        let style = currentShotStyle()
         let heading = zRotation + .pi/2
-        let fwd = CGVector(dx: cos(heading), dy: sin(heading))
-        let origin = CGPoint(x: position.x + fwd.dx * muzzleOffset,
-                             y: position.y + fwd.dy * muzzleOffset)
-        let vel = CGVector(dx: pb.velocity.dx + fwd.dx * bulletSpeed,
-                           dy: pb.velocity.dy + fwd.dy * bulletSpeed)
-        
-        let bullet = BulletNode(velocity: vel, life: CGFloat(bulletLife))
-        bullet.name = "bullet" // keep existing culling compatible
-        bullet.position = origin
-        bullet.zPosition = 900    // above world + car
-        scene.addChild(bullet)
-        bullet.attach(to: scene)
+
+        func spawn(angle: CGFloat) {
+            // 1) get a proper muzzle point in WORLD space
+            let muzzleWorld = convert(CGPoint(x: 0, y: muzzleOffset), to: scene)
+            let dir = CGVector(dx: cos(angle), dy: sin(angle))
+
+            // 2) create bullet centered at .zero (BulletNode below)
+            let b = BulletNode(style: style, damage: currentBulletDamage)
+            b.zRotation = angle
+            b.position  = muzzleWorld              // centered spawn point
+            scene.addChild(b)
+
+            // 3) give it velocity, inheriting the car's velocity
+            let vCar = pb.velocity
+            b.physicsBody?.velocity = CGVector(
+                dx: vCar.dx + dir.dx * bulletSpeed,
+                dy: vCar.dy + dir.dy * bulletSpeed
+            )
+        }
+
+        if weaponMod == .spread {
+            let off: CGFloat = .pi/26
+            spawn(angle: heading)
+            spawn(angle: heading - off)
+            spawn(angle: heading + off)
+        } else {
+            spawn(angle: heading)
+        }
+
         muzzleFlash()
     }
     
-    /// Hold-to-fire loop. Starts with an immediate shot, then repeats.
     func startAutoFire(on scene: SKScene) {
-        // already armed/looping?
         if action(forKey: fireArmKey) != nil || action(forKey: fireLoopKey) != nil { return }
         fireOnce(on: scene)
-        
         let arm = SKAction.sequence([
-            .wait(forDuration: autoFireArmDelay),
+            .wait(forDuration: 0.18),
             .run { [weak self, weak scene] in
                 guard let self, let scene else { return }
                 let loop = SKAction.sequence([
@@ -655,23 +601,14 @@ extension CarNode {
         run(arm, withKey: fireArmKey)
     }
     
-    func stopAutoFire() {
-        removeAction(forKey: fireArmKey)
-        removeAction(forKey: fireLoopKey)
-    }
-    
-    // Small visual at the nose.
     private func muzzleFlash() {
         let d: CGFloat = 8
         let flash = SKShapeNode(circleOfRadius: d/2)
         flash.fillColor = .white
         flash.strokeColor = UIColor.white.withAlphaComponent(0.25)
         flash.lineWidth = 1
-        flash.zPosition = 10  // above car parts
-        
-        // IMPORTANT: local space (front of car is +Y)
+        flash.zPosition = 10
         flash.position = CGPoint(x: 0, y: muzzleOffset)
-        
         addChild(flash)
         flash.run(.sequence([
             .group([.scale(to: 1.6, duration: 0.06),
@@ -689,7 +626,7 @@ extension CarNode {
     }
 }
 
-// MARK: - Health (unified: drives HUD + death/respawn)
+// MARK: - Health (HUD + death/respawn)
 extension CarNode {
     var maxHP: Int {
         get { _maxHP }
@@ -704,7 +641,8 @@ extension CarNode {
         get { (objc_getAssociatedObject(self, &Holder.maxHPKey) as? Int) ?? 100 }
         set { objc_setAssociatedObject(self, &Holder.maxHPKey, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
     }
-    private(set) var hp: Int {
+    
+    var hp: Int {
         get { (objc_getAssociatedObject(self, &Holder.hpKey) as? Int) ?? 100 }
         set { objc_setAssociatedObject(self, &Holder.hpKey, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
     }
@@ -730,16 +668,13 @@ extension CarNode {
         onHPChanged?(hp, maxHP)
     }
     
-    /// Ensure we actually receive crash contacts.
     func enableCrashContacts() {
         guard let pb = physicsBody else { return }
         pb.contactTestBitMask |= (Category.obstacle | Category.wall)
     }
     
-    // MARK: - Damage pipeline
-    // CarNode.swift — handleCrash(contact:other:)
+    // Contact → damage
     func handleCrash(contact: SKPhysicsContact, other: SKPhysicsBody) {
-        // Never take damage from ramps or hills
         if (other.categoryBitMask & Category.ramp) != 0 { return }
         if other.node is HillNode { return }
         
@@ -749,26 +684,11 @@ extension CarNode {
         if now - lastHitTime < iFrame { return }
         lastHitTime = now
         
-        // Compute impact point (scene space) for FX
         let hitPoint = contact.contactPoint
-        applyDamage(10, at: hitPoint)
+        applyDamage(10, hitWorldPoint: hitPoint)
     }
     
-    /// Single, unified damage entry. Triggers HUD via onHPChanged.
-    func applyDamage(_ amount: Int, at worldPoint: CGPoint) {
-        if isDead { return }
-        hp = max(0, hp - max(1, amount))
-        onHPChanged?(hp, maxHP)
-        playHitFX(at: worldPoint)
-        
-        if hp == 0 {
-            explode(at: worldPoint)
-        }
-    }
-    
-    // MARK: - FX
     private func playHitFX(at worldPoint: CGPoint?) {
-        // quick bump + flash
         removeAction(forKey: "hitFX")
         let bumpUp = SKAction.scale(to: 1.08, duration: 0.08); bumpUp.timingMode = .easeOut
         let bumpDn = SKAction.scale(to: 1.0,  duration: 0.12); bumpDn.timingMode = .easeIn
@@ -776,7 +696,6 @@ extension CarNode {
         let flashIn  = SKAction.fadeAlpha(to: 1.00, duration: 0.12)
         run(.sequence([.group([bumpUp, flashOut]), bumpDn, flashIn]), withKey: "hitFX")
         
-        // little ring at contact
         if let scene = scene, let p = worldPoint {
             let ring = SKShapeNode(circleOfRadius: 8)
             ring.position = p
@@ -796,8 +715,8 @@ extension CarNode {
     private func explode(at worldPoint: CGPoint) {
         guard !isDead else { return }
         isDead = true
-        
-        // stop motion & gate collisions while "dead"
+
+        // Freeze collisions
         if let pb = physicsBody {
             pb.velocity = .zero
             pb.angularVelocity = 0
@@ -805,12 +724,25 @@ extension CarNode {
             pb.collisionBitMask = 0
             pb.contactTestBitMask = 0
         }
-        
-        // Inform scene (does camera freeze + world pause + FX)
+
+        // Tell scene (shake/FX + camera freeze already happen there)
         delegate?.carNodeDidExplode(self, at: worldPoint)
-        
-        // Hide briefly, then respawn (keep node; don't remove permanently)
+
+        // Consume a life
+        livesLeft = max(0, livesLeft - 1)
+
+        // Hide the car sprite while “dead”
         isHidden = true
+
+        // Out of lives → stop here and let the scene show Game Over
+        if livesLeft == 0 {
+            // Tell the scene so it can show the overlay
+            delegate?.carNodeDidRunOutOfLives(self)
+            // Don’t auto-respawn — scene will call restartAfterGameOver(...)
+            return
+        }
+
+        // Still have lives → auto-respawn after a short delay
         run(.sequence([
             .wait(forDuration: 1.0),
             .run { [weak self] in
@@ -819,27 +751,50 @@ extension CarNode {
                 self.position = spawn
                 self.zRotation = 0
                 self.physicsBody?.velocity = .zero
-                
-                // restore physics masks
+
                 if let pb = self.physicsBody {
                     pb.categoryBitMask = Category.car
                     pb.collisionBitMask = Category.wall | Category.obstacle
                     pb.contactTestBitMask = Category.hole | Category.obstacle | Category.ramp
                     self.enableCrashContacts()
                 }
-                
-                self.resetHP()              // <- HUD updates here
+
+                self.resetHP()
+                self.resetEnhancements()
                 self.isHidden = false
                 self.isDead = false
             }
         ]))
     }
+    
+    func restartAfterGameOver(at spawn: CGPoint) {
+        // reset counters/state
+        resetLives()         // back to maxLives (default 3)
+        resetHP()
+        resetEnhancements()
+        isDead = false
+        isHidden = false
+
+        // restore physics masks
+        if let pb = physicsBody {
+            pb.velocity = .zero
+            pb.angularVelocity = 0
+            pb.categoryBitMask = Category.car
+            pb.collisionBitMask = Category.wall | Category.obstacle
+            pb.contactTestBitMask = Category.hole | Category.obstacle | Category.ramp
+            enableCrashContacts()
+        }
+
+        position = spawn
+        zRotation = 0
+        
+        onHPChanged?(hp, maxHP)
+    }
 }
 
+// MARK: - Hills (per-frame multipliers used by GameScene)
 extension CarNode {
-    private struct HillAssoc {
-        static var spd = 0, acc = 0, drg = 0
-    }
+    private struct HillAssoc { static var spd = 0, acc = 0, drg = 0 }
     /// Multiply forward/reverse speed cap while on hills (0…1, default 1).
     var hillSpeedMul: CGFloat {
         get { objc_getAssociatedObject(self, &HillAssoc.spd) as? CGFloat ?? 1 }
@@ -857,62 +812,450 @@ extension CarNode {
     }
 }
 
+// MARK: - Simple HUD
 final class CarHealthHUDNode: SKNode {
-    private let card = SKShapeNode()
-    private let barBG = SKShapeNode()
-    private let barFG = SKShapeNode()
-    private let label = SKLabelNode(fontNamed: "Menlo-Bold")
     
-    private let cardSize = CGSize(width: 160, height: 40)
-    
+    private let livesRow = SKNode()
+    private var heartNodes: [SKLabelNode] = []
+
+    // public API ---------------------------------------------------------------
+    func set(hp: Int, maxHP: Int, shield: Int) {
+        let hpC = max(0, min(hp, maxHP))
+        let shC = max(0, min(shield, 100)) // cap 100
+
+        // numbers
+        hpValueLabel.text = "\(hpC)/\(maxHP)"
+        if shC > 0 {
+            shieldChip.isHidden = false
+            shieldValueLabel.text = "\(shC)"
+        } else {
+            shieldChip.isHidden = true
+        }
+
+        // bars
+        let fracHP = CGFloat(hpC) / max(1, CGFloat(maxHP))
+        let fracSH = CGFloat(shC) / 100.0
+
+        let hpW = barWidth * fracHP
+        hpBar.path = CGPath(roundedRect: CGRect(x: -barWidth/2, y: -barH/2, width: hpW, height: barH),
+                            cornerWidth: barH/2, cornerHeight: barH/2, transform: nil)
+
+        let shW = barWidth * fracSH
+        shieldOverlay.path = CGPath(roundedRect: CGRect(x: -barWidth/2, y: -barH/2, width: shW, height: barH),
+                                    cornerWidth: barH/2, cornerHeight: barH/2, transform: nil)
+    }
+
+    func place(at worldPos: CGPoint) { position = worldPos }
+
+    // internals ----------------------------------------------------------------
+    private let card     = SKShapeNode()
+    private let hpTitle  = SKLabelNode(fontNamed: "Menlo-Bold")
+    private let hpValueLabel = SKLabelNode(fontNamed: "Menlo")
+    private let shieldChip = SKShapeNode()
+    private let shieldLabel = SKLabelNode(fontNamed: "Menlo-Bold")
+    private let shieldValueLabel = SKLabelNode(fontNamed: "Menlo")
+
+    private let barBase = SKShapeNode()
+    private let hpBar   = SKShapeNode()
+    private let shieldOverlay = SKShapeNode()
+
+    private let barWidth: CGFloat = 160
+    private let barH: CGFloat = 12
+
     override init() {
         super.init()
-        zPosition = 500
-        
-        let rect = CGRect(x: -cardSize.width/2, y: -cardSize.height/2, width: cardSize.width, height: cardSize.height)
-        card.path = CGPath(roundedRect: rect, cornerWidth: 12, cornerHeight: 12, transform: nil)
-        card.fillColor = UIColor(white: 0, alpha: 0.28)
+        zPosition = 700
+
+        let w: CGFloat = 180, h: CGFloat = 44
+        card.path = CGPath(roundedRect: CGRect(x: -w/2, y: -h/2 - 15, width: w, height: h),
+                           cornerWidth: 14, cornerHeight: 14, transform: nil)
+        card.fillColor   = UIColor(white: 0, alpha: 0.28)
         card.strokeColor = UIColor(white: 1, alpha: 0.10)
-        card.lineWidth = 1.0
+        card.lineWidth   = 1
         addChild(card)
+
+        hpTitle.text = "HP"
+        hpTitle.fontSize = 13
+        hpTitle.fontColor = UIColor.white.withAlphaComponent(0.9)
+        hpTitle.horizontalAlignmentMode = .left
+        hpTitle.verticalAlignmentMode = .center
+        hpTitle.position = CGPoint(x: -w/2 + 44, y: h/2 - 35.5)
+        addChild(hpTitle)
+
+        hpValueLabel.text = "0/0"
+        hpValueLabel.fontSize = 13
+        hpValueLabel.fontColor = UIColor.white.withAlphaComponent(0.9)
+        hpValueLabel.horizontalAlignmentMode = .left
+        hpValueLabel.verticalAlignmentMode = .center
+        hpValueLabel.position = CGPoint(x: -w/2 + 64, y: h/2 - 36)
+        addChild(hpValueLabel)
+
+        let chipH: CGFloat = 18
+        let chipW: CGFloat = 90
+        shieldChip.path = CGPath(roundedRect: CGRect(x: -chipW/2, y: -chipH/2, width: chipW, height: chipH),
+                                 cornerWidth: chipH/2, cornerHeight: chipH/2, transform: nil)
+        shieldChip.fillColor   = UIColor.systemBlue.withAlphaComponent(0.25)
+        shieldChip.strokeColor = UIColor.systemBlue.withAlphaComponent(0.8)
+        shieldChip.lineWidth   = 1
+        shieldChip.position = CGPoint(x: -w/2 + 160, y: h/2 - 15)
+        addChild(shieldChip)
+
+        shieldLabel.text = "Shield"
+        shieldLabel.fontSize = 12
+        shieldLabel.fontColor = UIColor.white
+        shieldLabel.verticalAlignmentMode = .center
+        shieldLabel.horizontalAlignmentMode = .center
+        shieldLabel.position = CGPoint(x: -18, y: 0)
+        shieldChip.addChild(shieldLabel)
+
+        shieldValueLabel.text = "0"
+        shieldValueLabel.fontSize = 12
+        shieldValueLabel.fontColor = UIColor.white
+        shieldValueLabel.verticalAlignmentMode = .center
+        shieldValueLabel.horizontalAlignmentMode = .center
+        shieldValueLabel.position = CGPoint(x: 26, y: 0)
+        shieldChip.addChild(shieldValueLabel)
+
+        barBase.path = CGPath(roundedRect: CGRect(x: -barWidth/2, y: -barH/2, width: barWidth, height: barH),
+                              cornerWidth: barH/2, cornerHeight: barH/2, transform: nil)
+        barBase.fillColor = UIColor.white.withAlphaComponent(0.10)
+        barBase.strokeColor = UIColor.white.withAlphaComponent(0.08)
+        barBase.lineWidth = 1
+        barBase.position = CGPoint(x: 0, y: -14)
+        addChild(barBase)
+
+        hpBar.fillColor = UIColor.systemGreen.withAlphaComponent(0.9)
+        hpBar.strokeColor = .clear
+        hpBar.position = barBase.position
+        addChild(hpBar)
+
+        shieldOverlay.fillColor = UIColor.systemBlue.withAlphaComponent(0.85)
+        shieldOverlay.strokeColor = .clear
+        shieldOverlay.position = barBase.position
+        shieldOverlay.zPosition = 1
+        addChild(shieldOverlay)
         
-        let bgRect = CGRect(x: rect.minX + 10, y: rect.midY - 5, width: rect.width - 20, height: 10)
-        barBG.path = CGPath(roundedRect: bgRect, cornerWidth: 5, cornerHeight: 5, transform: nil)
-        barBG.fillColor = UIColor.white.withAlphaComponent(0.12)
-        barBG.strokeColor = .clear
-        addChild(barBG)
-        
-        barFG.fillColor = UIColor.systemGreen.withAlphaComponent(0.9)
-        barFG.strokeColor = .clear
-        addChild(barFG)
-        
-        label.fontSize = 14
-        label.verticalAlignmentMode = .center
-        label.horizontalAlignmentMode = .center
-        label.fontColor = UIColor.white.withAlphaComponent(0.95)
-        label.position = CGPoint(x: 0, y: rect.midY - 16)
-        addChild(label)
-        
-        set(hp: 100, maxHP: 100)
+        livesRow.position = CGPoint(x: 0, y: 14) // above the bar
+        addChild(livesRow)
+        setLives(left: 3, max: 3)
+
+        shieldChip.isHidden = true
+        set(hp: 0, maxHP: 100, shield: 0)
     }
-    
+
     required init?(coder: NSCoder) { fatalError() }
     
-    func set(hp: Int, maxHP: Int) {
-        let rect = card.frame
-        let bgRect = CGRect(x: rect.minX + 10, y: rect.midY - 5, width: rect.width - 20, height: 10)
-        let frac = max(0, min(1, CGFloat(hp) / CGFloat(max(1, maxHP))))
-        let w = max(1, bgRect.width * frac)
-        let fgRect = CGRect(x: bgRect.minX, y: bgRect.minY, width: w, height: bgRect.height)
-        barFG.path = CGPath(roundedRect: fgRect, cornerWidth: 5, cornerHeight: 5, transform: nil)
+    func setLives(left: Int, max: Int) {
+        rebuildLives(left: left, max: max)
+    }
+
+    private func rebuildLives(left: Int, max: Int) {
+        livesRow.removeAllChildren()
+        heartNodes.removeAll()
         
-        // color shift (green→yellow→red)
-        let c: UIColor
-        if frac > 0.66 { c = .systemGreen }
-        else if frac > 0.33 { c = .systemYellow }
-        else { c = .systemRed }
-        barFG.fillColor = c.withAlphaComponent(0.9)
+        // layout
+        let spacing: CGFloat = 16
+        let totalW = spacing * CGFloat(max - 1)
+        let startX = -totalW / 2.0
         
-        label.text = "HP \(hp)/\(maxHP)"
+        for i in 0..<max {
+            let lbl = SKLabelNode(fontNamed: "Menlo-Bold")
+            lbl.fontSize = 14
+            lbl.verticalAlignmentMode = .center
+            lbl.horizontalAlignmentMode = .center
+            let filled = i < left
+            lbl.text = filled ? "♥︎" : "♡"
+            lbl.fontColor = filled ? UIColor.systemRed : UIColor.white.withAlphaComponent(0.6)
+            lbl.position = CGPoint(x: startX + CGFloat(i) * spacing, y: 0)
+            livesRow.addChild(lbl)
+            heartNodes.append(lbl)
+        }
+    }
+}
+
+// MARK: - Enhancements (real gameplay effects, persistent)
+private final class CGPathBox: NSObject { let value: CGPath; init(_ v: CGPath) { value = v } }
+
+extension CarNode {
+    
+    // Store the original chassis for physics rebuilds after Mini Mode.
+    private struct EnhAssoc {
+        static var basePath = 0
+        static var shield = 0
+        static var weapon = 0
+        static var control = 0
+        static var mini = 0
+        static var baseTurn = 0
+        static var baseTraction = 0
+    }
+    
+    // Keep the raw path boxed to avoid CF bridging warnings.
+    var baseChassisPath: CGPath? {
+        get { (objc_getAssociatedObject(self, &EnhAssoc.basePath) as? CGPathBox)?.value }
+        set {
+            if let p = newValue {
+                objc_setAssociatedObject(self, &EnhAssoc.basePath, CGPathBox(p), .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+            } else {
+                objc_setAssociatedObject(self, &EnhAssoc.basePath, nil, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+            }
+        }
+    }
+    
+    // MARK: Shield (0…100). Absorbs damage before HP.
+    var shield: Int {
+        get { (objc_getAssociatedObject(self, &EnhAssoc.shield) as? Int) ?? 0 }
+        set {
+            let clamped = max(0, min(100, newValue))
+            objc_setAssociatedObject(self, &EnhAssoc.shield, clamped, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+            (scene as? CarShieldReporting)?.onShieldChanged?(clamped)
+        }
+    }
+    
+    // MARK: Weapon mod (one at a time)
+    enum WeaponMod: Int { case none = 0, rapid, damage, spread
+        var display: String {
+            switch self {
+            case .none: return "None"
+            case .rapid: return "Rapid Fire"
+            case .damage: return "Damage Boost"
+            case .spread: return "Spread Shot"
+            }
+        }
+    }
+    var weaponMod: WeaponMod {
+        get { WeaponMod(rawValue: (objc_getAssociatedObject(self, &EnhAssoc.weapon) as? Int) ?? 0) ?? .none }
+        set {
+            objc_setAssociatedObject(self, &EnhAssoc.weapon, newValue.rawValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+            (scene as? CarWeaponReporting)?.onWeaponChanged?(newValue.display)
+        }
+    }
+    
+    // MARK: Control boost (persistent; non-stacking)
+    var controlBoostActive: Bool {
+        get { (objc_getAssociatedObject(self, &EnhAssoc.control) as? Bool) ?? false }
+        set {
+            let was = controlBoostActive
+            objc_setAssociatedObject(self, &EnhAssoc.control, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+            if newValue == was { return }
+            if objc_getAssociatedObject(self, &EnhAssoc.baseTurn) == nil {
+                objc_setAssociatedObject(self, &EnhAssoc.baseTurn, self.turnRate, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+            }
+            if objc_getAssociatedObject(self, &EnhAssoc.baseTraction) == nil {
+                objc_setAssociatedObject(self, &EnhAssoc.baseTraction, self.traction, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+            }
+            if newValue {
+                self.turnRate = (objc_getAssociatedObject(self, &EnhAssoc.baseTurn) as? CGFloat ?? self.turnRate) * 1.22
+                self.traction = (objc_getAssociatedObject(self, &EnhAssoc.baseTraction) as? CGFloat ?? self.traction) * 1.18
+            } else {
+                if let base = objc_getAssociatedObject(self, &EnhAssoc.baseTurn) as? CGFloat { self.turnRate = base }
+                if let base = objc_getAssociatedObject(self, &EnhAssoc.baseTraction) as? CGFloat { self.traction = base }
+            }
+            (scene as? CarStatusReporting)?.onControlBoostChanged?(newValue)
+        }
+    }
+    
+    // MARK: Mini Mode (persistent; non-stacking)
+    var miniModeActive: Bool {
+        get { (objc_getAssociatedObject(self, &EnhAssoc.mini) as? Bool) ?? false }
+        set {
+            let was = miniModeActive
+            objc_setAssociatedObject(self, &EnhAssoc.mini, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+            if newValue == was { return }
+            
+            let targetScale: CGFloat = newValue ? 0.94 : 1.0
+            let act = SKAction.group([
+                .scaleX(to: targetScale, duration: 0.32),
+                .scaleY(to: targetScale, duration: 0.32)
+            ])
+            act.timingMode = .easeInEaseOut
+            run(act)
+            rebuildBody(scale: targetScale)
+            (scene as? CarStatusReporting)?.onMiniModeChanged?(newValue)
+        }
+    }
+    
+    private func rebuildBody(scale: CGFloat) {
+        guard let base = baseChassisPath, let old = physicsBody else { return }
+        var t = CGAffineTransform(scaleX: scale, y: scale)
+        let scaled = base.copy(using: &t) ?? base
+        
+        let saveCat = old.categoryBitMask
+        let saveCol = old.collisionBitMask
+        let saveCon = old.contactTestBitMask
+        let dyn = old.isDynamic
+        let precise = old.usesPreciseCollisionDetection
+        
+        let pb = SKPhysicsBody(polygonFrom: scaled)
+        pb.isDynamic = dyn
+        pb.allowsRotation = false
+        pb.friction = 0
+        pb.linearDamping = drag
+        pb.angularDamping = 2
+        pb.affectedByGravity = false
+        pb.usesPreciseCollisionDetection = precise
+        pb.categoryBitMask = saveCat
+        pb.collisionBitMask = saveCol
+        pb.contactTestBitMask = saveCon
+        self.physicsBody = pb
+        
+        _groundMask = pb.collisionBitMask
+    }
+    
+    // MARK: Enhancement application (GameScene calls this when picking up)
+    @discardableResult
+    func applyEnhancement(_ kind: EnhancementKind) -> Bool {
+        switch kind {
+        case .hp20:
+            if hp >= maxHP { return false }
+            hp = min(maxHP, hp + 20); onHPChanged?(hp, maxHP); return true
+            
+        case .shield20:
+            if shield >= 100 { return false }
+            shield = min(100, shield + 20); return true
+            
+        case .weaponRapid:   weaponMod = .rapid;  return true
+        case .weaponDamage:  weaponMod = .damage; return true
+        case .weaponSpread:  weaponMod = .spread; return true
+        case .control:       if controlBoostActive { return false }; controlBoostActive = true; return true
+        case .shrink:        if miniModeActive { return false }; miniModeActive = true; return true
+            
+        @unknown default: return false
+        }
+    }
+    
+    // Damage helpers routed through shield
+    func applyDamage(_ raw: Int, hitWorldPoint: CGPoint? = nil) {
+        var dmg = max(0, raw)
+        if shield > 0, dmg > 0 {
+            let used = min(shield, dmg)
+            shield -= used
+            dmg    -= used
+        }
+        if dmg > 0 { hp = max(0, hp - dmg) }
+        onHPChanged?(hp, maxHP)
+        playHitFX(at: hitWorldPoint)
+        if hp == 0 {
+            let world = hitWorldPoint
+            ?? (scene.flatMap { self.convert(.zero, to: $0) })
+            ?? .zero
+            explode(at: world)
+        }
+    }
+    
+    @objc func resetEnhancements() {
+        controlBoostActive = false
+        miniModeActive = false
+        weaponMod = .none
+        shield = 0
+    }
+    
+    @discardableResult
+    func applyIncomingCrashImpulse(_ impulse: CGFloat) -> Int {
+        let raw = max(0, impulse - 30) * 0.28
+        let dmg = Int(raw.rounded())
+        guard dmg > 0 else { return 0 }
+        return applyIncomingDamage(dmg)
+    }
+    
+    @discardableResult
+    func applyIncomingDamage(_ amount: Int) -> Int {
+        var remaining = max(0, amount)
+        if shield > 0 {
+            let absorbed = min(shield, remaining)
+            shield -= absorbed
+            remaining -= absorbed
+        }
+        if remaining > 0 {
+            let was = hp
+            hp = max(0, hp - remaining)
+            onHPChanged?(hp, maxHP)
+            return was - hp
+        }
+        return 0
+    }
+}
+
+// MARK: - Driving update
+extension CarNode {
+    func update(_ dt: CGFloat) {
+        guard let pb = physicsBody else { return }
+        let heading = zRotation + .pi/2
+        let fwd     = CGVector(dx: cos(heading),  dy: sin(heading))
+        let right   = CGVector(dx: -sin(heading), dy: cos(heading))
+        
+        if isAirborne {
+            let retain = exp(-dt * 2.3)
+            var vv = pb.velocity
+            vv.dx *= retain; vv.dy *= retain
+            let airCap = (maxSpeed + max(0, speedCapBonus)) * 0.78
+            let sp = hypot(vv.dx, vv.dy)
+            if sp > airCap {
+                let k = airCap / max(sp, 0.001)
+                vv.dx *= k; vv.dy *= k
+            }
+            pb.velocity = vv
+            let yaw = steer.clamped(-1, 1) * (turnRate * 0.35)
+            zRotation += yaw * dt
+            pb.angularVelocity = 0
+            let fwdMag  = vv.dx * fwd.dx + vv.dy * fwd.dy
+            updateExhaust(speed: sp, fwdMag: fwdMag, dt: dt)
+            return
+        }
+        
+        var v      = pb.velocity
+        let fwdMag = v.dx * fwd.dx + v.dy * fwd.dy
+        let latMag = v.dx * right.dx + v.dy * right.dy
+        
+        let latKill = 1 - exp(-dt * traction * 4.0)
+        v.dx -= right.dx * latMag * latKill
+        v.dy -= right.dy * latMag * latKill
+        pb.velocity = v
+        
+        if hillDragK > 0 {
+            let keep = exp(-dt * hillDragK)
+            var vv = pb.velocity
+            vv.dx *= keep; vv.dy *= keep
+            pb.velocity = vv
+        }
+        
+        if abs(throttle) < 0.001 && abs(steer) < 0.001 {
+            let lin = exp(-dt * 14.0)
+            var vv = pb.velocity
+            vv.dx *= lin; vv.dy *= lin
+            if hypot(vv.dx, vv.dy) < 1.0 { vv = .zero }
+            pb.velocity = vv
+            pb.angularVelocity = 0
+            updateExhaust(speed: 0, fwdMag: 0, dt: dt)
+            return
+        }
+        
+        // drive
+        let input = throttle.clamped(-1, 1)
+        let opposes = (input > 0 && fwdMag < 0) || (input < 0 && fwdMag > 0)
+        if opposes {
+            let sign: CGFloat = fwdMag >= 0 ? 1 : -1
+            pb.applyForce(fwd.scaled(-sign * brakeForce))
+        } else {
+            pb.applyForce(fwd.scaled(input * acceleration * max(0, hillAccelMul)))
+        }
+        
+        let capForwardBase = maxSpeed + max(0, speedCapBonus)
+        let capForward     = capForwardBase * max(0.1, hillSpeedMul)
+        let cap = (fwdMag >= 0 ? capForward : maxSpeed * reverseSpeedFactor)
+        let speed = hypot(pb.velocity.dx, pb.velocity.dy)
+        if speed > cap {
+            let s = cap / max(speed, 0.001)
+            pb.velocity = CGVector(dx: pb.velocity.dx * s, dy: pb.velocity.dy * s)
+        }
+        
+        let speedScale = 0.50 + 0.50 * CGFloat.clamp(abs(fwdMag) / 240.0, 0, 1)
+        let slowAssist = 1.0 + CGFloat.clamp(80 - abs(fwdMag), 0, 80) / 90.0
+        let commandedYaw = steer.clamped(-1, 1) * turnRate * speedScale * slowAssist
+        let maxYaw: CGFloat = 4.0
+        let yaw = CGFloat.clamp(commandedYaw, -maxYaw, maxYaw)
+        zRotation += yaw * dt
+        pb.angularVelocity = 0
+        
+        updateExhaust(speed: hypot(pb.velocity.dx, pb.velocity.dy), fwdMag: fwdMag, dt: dt)
     }
 }

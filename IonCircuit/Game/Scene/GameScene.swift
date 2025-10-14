@@ -139,7 +139,10 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     private var hills: [HillNode] = []
     
     // UI / HUD
+    // UI / HUD
     private let healthHUD = CarHealthHUDNode()
+    private let enhancementHUD = EnhancementHUDNode()
+    private let gameOverOverlay = GameOverOverlayNode()
     
     // ==== Controls / Handedness ====
     private var isLeftHanded = true
@@ -178,6 +181,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         speedHUD.isPaused = true
         headingHUD.isPaused = true
         rampPointer.isPaused = true
+        enhancementHUD.isPaused = true
     }
     
     private func resumeWorldAfterRespawn() {      // NEW
@@ -192,6 +196,34 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         speedHUD.isPaused = false
         headingHUD.isPaused = false
         rampPointer.isPaused = false
+        enhancementHUD.isPaused = false
+    }
+    
+    // MARK: Enhancements reset (on death)
+    private func resetEnhancementsOnDeath() {
+        // Car: call strongly if it conforms, else fall back to Obj-C selector safely.
+        if let resettable = car as? CarEnhancementResetting {
+            resettable.resetEnhancements()
+        } else if (car as NSObject).responds(to: #selector(CarEnhancementResetting.resetEnhancements)) {
+            (car as NSObject).perform(#selector(CarEnhancementResetting.resetEnhancements))
+        }
+        
+        // HUD: find it, then either use the protocol or a selector fallback.
+        if let hud = camera?.children.first(where: { $0 is EnhancementHUDNode }) {
+            if let clearing = hud as? EnhancementHUDClearing {
+                clearing.clearAll()
+            } else if (hud as NSObject).responds(to: #selector(EnhancementHUDClearing.clearAll)) {
+                (hud as NSObject).perform(#selector(EnhancementHUDClearing.clearAll))
+            } else {
+                hud.removeAllChildren()
+                enhancementHUD.place(in: size)
+            }
+        } else {
+            enhancementHUD.removeAllChildren()
+            enhancementHUD.place(in: size)
+        }
+        
+        //        enhancementHUD.flashToast("Enhancements reset", tint: .systemTeal)
     }
     
     // MARK: - Scene lifecycle
@@ -218,6 +250,11 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         addChild(car)
         car.enableAirPhysics()
         car.delegate = self
+        
+        
+        let n = EnhancementNode(kind: .shield20)
+        n.position = safeSpawnPoint(in: searchRect.insetBy(dx: 40, dy: 300), radius: spawnClearance)
+        obstacleRoot.addChild(n)
         
         // Streaming root
         worldSeed = UInt64.random(in: 1...UInt64.max)
@@ -264,14 +301,50 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         
         // Car damage notifications → HUD
         car.maxHP = 100
-        car.onHPChanged = { [weak self] hp, maxHP in
-            self?.healthHUD.set(hp: hp, maxHP: maxHP)
-        }
-        car.onHPChanged?(car.hp, car.maxHP)
+        
+        // When HP changes (including after shield-only hits, because we call onHPChanged above)
+        car.onHPChanged = { [weak self] _, _ in self?.updateHealthHUD() }
+        car.onHPChanged?(car.hp, car.maxHP)   // initial draw
         car.enableCrashContacts()
+        
+        car.onLivesChanged = { [weak self] lives, max in
+            self?.healthHUD.setLives(left: lives, max: max)
+        }
+        // initial draw
+        healthHUD.setLives(left: car.livesLeft, max: car.maxLives)
         
         // Show handedness overlay EVERY time app opens (but don't block controls)
         showHandednessPicker()
+        setupEnhancementHUD()
+        
+        // After you create the camera node `cam`
+        cam.addChild(gameOverOverlay)
+
+        // restart handler
+        gameOverOverlay.onRestart = { [weak self] in
+            guard let self = self else { return }
+            self.gameOverOverlay.hide()
+
+            // get a safe spawn in the camera’s visible area
+            let spawn = self.safeSpawnPoint(
+                in: self.cameraWorldRect(margin: 400).insetBy(dx: 120, dy: 120),
+                radius: self.spawnClearance
+            )
+
+            // reset the car + world
+            self.car.restartAfterGameOver(at: spawn)
+            self.cameraFrozenPos = nil
+            self.resumeWorldAfterRespawn()
+        }
+    }
+    
+    private func setupEnhancementHUD() {
+        guard let cam = camera else { return }
+        if enhancementHUD.parent == nil {
+            cam.addChild(enhancementHUD)
+        }
+        enhancementHUD.position = .zero   // centered; it lays out itself
+        enhancementHUD.place(in: size)
     }
     
     private func showHandednessPicker() {
@@ -291,6 +364,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         placeHUD()
         placeFireButton()
         handednessOverlay?.updateSize(size)
+        reflowEnhancementHUD()
     }
     
     // MARK: - Speed ring
@@ -638,7 +712,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         cam.removeAllActions()              // cancel any residual shake
         cam.position = car.position         // hard-lock car at screen center
     }
-
+    
     // Keep the camera lock AFTER physics each frame so it never lags
     override func didSimulatePhysics() {
         // If we're freezing on death, don't re-center until respawn
@@ -668,8 +742,87 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
             }
             return
         }
+        
+        applyHillBottomOneWayGuard(dt: CGFloat(_lastDTForClamp))
         recenterCameraOnCar()
+        _hadSolidContactThisStep = false
     }
+    
+    @inline(__always)
+    private func applyHillBottomOneWayGuard(dt: CGFloat) {
+        // Only on ground, only if we have physics
+        guard !car.isAirborne, let pb = car.physicsBody else { return }
+        
+        // ---- Tunables (adjust to taste) ----
+        let innerBand: CGFloat   = 0.965   // r just inside the ellipse edge
+        let outerBand: CGFloat   = 1.035   // r just outside the ellipse edge
+        let blockOuter: CGFloat  = 1.08    // how far outside we still block inward entry
+        let minOutward: CGFloat  = 220.0   // ensure at least this outward speed in the ring
+        let maxAccelPS: CGFloat  = 2200.0  // max outward speed change per second
+        let tinyBias: CGFloat    = 60.0    // small outward bias when blocking entry
+        let ghTol: CGFloat       = 10.0    // only treat as “bottom” when ground is ~flat (near 0)
+        
+        let p = car.position
+        
+        // Find the closest hill edge (r ≈ 1) around us where ground is low
+        var best: (r: CGFloat, cx: CGFloat, cy: CGFloat, rx: CGFloat, ry: CGFloat)?
+        for hill in hills where hill.parent != nil {
+            let f = hill.calculateAccumulatedFrame()
+            let cx = f.midX, cy = f.midY
+            let rx = max(1, f.width * 0.5), ry = max(1, f.height * 0.5)
+            // ellipse radius parameter r (1 = exact edge)
+            let dx = p.x - cx, dy = p.y - cy
+            let r  = sqrt((dx*dx)/(rx*rx) + (dy*dy)/(ry*ry))
+            
+            // Only consider if we’re at the *bottom* (height ~ 0)
+            if groundHeight(at: p) <= ghTol {
+                if best == nil || abs(r - 1) < abs(best!.r - 1) {
+                    best = (r, cx, cy, rx, ry)
+                }
+            }
+        }
+        guard let b = best else { return }
+        
+        // Outward unit normal for an ellipse: ∇(x^2/rx^2 + y^2/ry^2) = (2x/rx^2, 2y/ry^2)
+        let dx = p.x - b.cx, dy = p.y - b.cy
+        if abs(dx) < 1e-6 && abs(dy) < 1e-6 { return } // at center; ignore
+        var nx = dx / (b.rx * b.rx), ny = dy / (b.ry * b.ry)
+        let nlen = max(1e-6, sqrt(nx*nx + ny*ny))
+        nx /= nlen; ny /= nlen
+        
+        // Radial (outward) velocity component
+        let v = pb.velocity
+        let vRad = v.dx * nx + v.dy * ny
+        
+        // Per-step clamp
+        let dtClamp = max(1.0/240.0, min(0.05, dt))
+        let maxDelta = maxAccelPS * dtClamp
+        
+        // Inside the thin bottom ring → push outward
+        if b.r >= innerBand && b.r <= outerBand {
+            let need = max(0, minOutward - vRad)
+            if need > 0 {
+                let add = min(maxDelta, need)
+                pb.velocity = CGVector(dx: v.dx + nx * add, dy: v.dy + ny * add)
+                // tiny positional nudge to avoid re-hitting the exact boundary next frame
+                car.position = CGPoint(x: car.position.x + nx * 0.5, y: car.position.y + ny * 0.5)
+            }
+            return
+        }
+        
+        // Just outside the ring → do not allow entry (strip inward component, add tiny outward bias)
+        if b.r > outerBand && b.r < blockOuter, vRad < 0 {
+            var out = v
+            // remove inward (negative) radial component
+            out.dx -= nx * vRad
+            out.dy -= ny * vRad
+            // tiny outward bias so we don’t sit on the fence
+            out.dx += nx * tinyBias
+            out.dy += ny * tinyBias
+            pb.velocity = out
+        }
+    }
+    
     
     private func updateSpeedHUD(kmh: CGFloat) {
         let now = CACurrentMediaTime()
@@ -737,90 +890,28 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         }
     }
     
+    func carNodeDidRunOutOfLives(_ car: CarNode) {
+        // Camera is already frozen + world paused from carNodeDidExplode(_:)
+        // Just show the overlay.
+        if let cam = camera {
+            gameOverOverlay.show(in: cam, size: size)
+        }
+    }
+    
     // MARK: - Touch helpers
     private func isTouchOnCarScene(_ pScene: CGPoint) -> Bool {
         for n in nodes(at: pScene) where (n === car || n.inParentHierarchy(car)) { return true }
         return car.position.distance(to: pScene) <= 26
     }
     
-    // MARK: - SKPhysicsContactDelegate
-    func didBegin(_ contact: SKPhysicsContact) {
-        let bodyA = contact.bodyA
-        let bodyB = contact.bodyB
-        
-        @inline(__always) func isBullet(_ b: SKPhysicsBody) -> Bool { (b.categoryBitMask & Category.bullet) != 0 }
-        @inline(__always) func isObstacle(_ b: SKPhysicsBody) -> Bool { (b.categoryBitMask & Category.obstacle) != 0 }
-        @inline(__always) func isWall(_ b: SKPhysicsBody) -> Bool { (b.categoryBitMask & Category.wall) != 0 }
-        @inline(__always) func isCar(_ b: SKPhysicsBody) -> Bool { (b.categoryBitMask & Category.car) != 0 }
-        @inline(__always) func isRamp(_ b: SKPhysicsBody) -> Bool { (b.categoryBitMask & Category.ramp) != 0 }
-        @inline(__always) func isHill(_ b: SKPhysicsBody) -> Bool { b.node is HillNode }
-        @inline(__always) func killBullet(_ b: SKPhysicsBody) {
-            b.node?.removeAllActions()
-            b.node?.removeFromParent()
-        }
-        
-        // Bullet ↔ Obstacle
-        if (isBullet(bodyA) && isObstacle(bodyB)) || (isBullet(bodyB) && isObstacle(bodyA)) {
-            let bullet   = isBullet(bodyA) ? bodyA : bodyB
-            let obstacle = isObstacle(bodyA) ? bodyA : bodyB
-            if let ob = obstacle.node as? ObstacleNode {
-                let hitScene = contact.contactPoint
-                let hitLocal = ob.convert(hitScene, from: self)
-                _ = ob.applyDamage(1, impact: hitLocal)
-            }
-            killBullet(bullet); return
-        }
-        
-        // Bullet ↔ Wall
-        if (isBullet(bodyA) && isWall(bodyB)) || (isBullet(bodyB) && isWall(bodyA)) {
-            let bullet = isBullet(bodyA) ? bodyA : bodyB
-            killBullet(bullet); return
-        }
-        
-        // Car ↔ Ramp (launch only; no damage here)
-        if (isCar(bodyA) && isRamp(bodyB)) || (isCar(bodyB) && isRamp(bodyA)) {
-            guard !car.isAirborne else { return }
-            let rampBody = isRamp(bodyA) ? bodyA : bodyB
-            guard let ramp = rampBody.node as? RampNode else { return }
-            
-            let carHeading  = car.zRotation + .pi/2
-            var align = cos(self.shortestAngle(from: carHeading, to: ramp.heading))
-            align = max(0, align)
-            
-            let spd = car.physicsBody?.velocity.length ?? 0
-            let spdFrac = min(1, spd / max(1, car.maxSpeed))
-            
-            let vz0 = ramp.strengthZ * max(0.72, (0.55 + 0.45*spdFrac)) * align
-            let fwdPush = (0.35 * spd + 0.18 * vz0) * align
-            let fwdBoost = min(600, max(0, fwdPush))
-            
-            car.applyRampImpulse(vzAdd: vz0, forwardBoost: fwdBoost, heading: ramp.heading)
-            return
-        }
-        
-        // Car ↔ Obstacle/Wall (damage), BUT NEVER from ramps or hills
-        let harmMask: UInt32 = (Category.obstacle | Category.wall)
-        let carA  = (bodyA.categoryBitMask & Category.car) != 0
-        let carB  = (bodyB.categoryBitMask & Category.car) != 0
-        let harmA = (bodyA.categoryBitMask & harmMask) != 0
-        let harmB = (bodyB.categoryBitMask & harmMask) != 0
-        
-        if (carA && harmB) || (carB && harmA) {
-            let carBody = carA ? bodyA : bodyB
-            let other   = carA ? bodyB : bodyA
-            
-            // ⛔ Never damage from ramps or hills
-            if isRamp(other) { return }
-            if isHill(other) { return }
-            
-            _hadSolidContactThisStep = true   // ← NEW: remember this step had a solid contact
-            (carBody.node as? CarNode)?.handleCrash(contact: contact, other: other)
-            return
-        }
-    }
-    
     // MARK: - Touches
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let t = touches.first else { return }
+        // If overlay is visible, let it consume the touch first
+        if !gameOverOverlay.isHidden {
+            if gameOverOverlay.handleTouch(scenePoint: t.location(in: self)) { return }
+        }
+        
         if controlsLockedForOverlay || pausedForDeath { return }   // NEW guard
         guard let cam = camera else { return }
         
@@ -1054,6 +1145,10 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         var nodes: [SKNode] = []
         spawnObstacles(in: rect, nodesOut: &nodes, cx: cx, cy: cy)
         spawnHillsAndRamps(in: rect, nodesOut: &nodes, cx: cx, cy: cy)
+        
+        // === Unrelated ground enhancements (independent rolls) ===
+        spawnGroundEnhancements(in: rect, nodesOut: &nodes, cx: cx, cy: cy)
+        
         loadedChunks[key] = nodes
     }
     
@@ -1177,14 +1272,41 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     
     // MARK: - Placement utilities
     
-    private func clearanceOK(at p: CGPoint, radius: CGFloat, mask: UInt32) -> Bool {
+    // MARK: - Placement utilities
+
+    @discardableResult
+    private func clearanceOK(
+        at p: CGPoint,
+        radius: CGFloat,
+        mask: UInt32,
+        ignoring ignoreSet: Set<SKNode> = []
+    ) -> Bool {
         var blocked = false
-        let r = CGRect(x: p.x - radius, y: p.y - radius, width: radius*2, height: radius*2)
-        physicsWorld.enumerateBodies(in: r) { body, stop in
-            if (body.categoryBitMask & mask) != 0 {
-                blocked = true; stop.pointee = true
+        let box = CGRect(x: p.x - radius, y: p.y - radius, width: radius * 2, height: radius * 2)
+
+        physicsWorld.enumerateBodies(in: box) { body, stop in
+            // only consider masked bodies
+            guard (body.categoryBitMask & mask) != 0 else { return }
+
+            // skip the explicitly ignored nodes (and anything inside them)
+            if let n = body.node {
+                if ignoreSet.contains(where: { n === $0 || n.inParentHierarchy($0) || $0.inParentHierarchy(n) }) {
+                    return
+                }
             }
+
+            // filter out AABB-only overlaps that don't actually touch our circle
+            if let n = body.node {
+                let fr = n.calculateAccumulatedFrame()
+                if !self.circleIntersectsRect(center: p, radius: radius, rect: fr) {
+                    return
+                }
+            }
+
+            blocked = true
+            stop.pointee = true
         }
+
         return !blocked
     }
     
@@ -1269,12 +1391,6 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         return h
     }
     
-    func spawnRamp(at center: CGPoint, size: CGSize, angleRadians: CGFloat, strengthZ: CGFloat = 850) {
-        let ramp = RampNode(center: center, size: size, heading: angleRadians, strengthZ: strengthZ)
-        ramp.zPosition = 0.4
-        obstacleRoot.addChild(ramp)
-    }
-    
     @inline(__always)
     private func ellipseRadiusAlong(rx: CGFloat, ry: CGFloat, vx: CGFloat, vy: CGFloat) -> CGFloat {
         let denom = sqrt((vx*vx)/(rx*rx) + (vy*vy)/(ry*ry))
@@ -1322,7 +1438,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
             rng.range(-.pi ... .pi)
         ]
         
-        let rampWidthRange: ClosedRange<CGFloat>  = 64...88
+        let rampWidthRange: ClosedRange<CGFloat>  = 74...98
         let rampLengthRange: ClosedRange<CGFloat> = 110...160
         
         for heading in candidates {
@@ -1408,6 +1524,9 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
                     nodesOut.append(r)
                 }
             }
+            
+            // === Hill enhancement: separate roll, 80% open (no guard) ===
+            maybeSpawnEnhancement(on: hill, rng: &rng)
         }
     }
     
@@ -1471,6 +1590,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         let raw = (lastUpdate == 0) ? 0 : (currentTime - lastUpdate)
         lastUpdate = currentTime
         let dt = CGFloat(min(max(raw, 0), 0.05))
+        stepEnhancementHUD(dt)
         
         // Freeze camera hard while dead; unfreeze on respawn
         if let freeze = cameraFrozenPos {
@@ -1950,18 +2070,615 @@ extension GameScene {
 // MARK: - CarNodeDelegate
 extension GameScene: CarNodeDelegate {
     func carNodeDidExplode(_ car: CarNode, at position: CGPoint) {
-        spawnDestructionFX(at: position, for: .steel)
-        shakeCamera(intensity: 6, duration: 0.20)
-        
-        // HARD FREEZE the camera until respawn + pause world
-        cameraFrozenPos = position
-        camera?.removeAllActions()
-        camera?.position = position
-        pauseWorldForDeath()     // NEW
+        // your existing explode handling (camera shake, freeze, etc.)
+        freezeCamera(at: car.position) // if you already have this helper
     }
+    
+    private func freezeCamera(at pos: CGPoint) {
+        cameraFrozenPos = pos      // uses your existing property
+    }
+
     func carNodeRequestRespawnPoint(_ car: CarNode) -> CGPoint {
-        let search = cameraWorldRect(margin: 400).insetBy(dx: 120, dy: 120)
-        return safeSpawnPoint(in: search, radius: spawnClearance)
+        // your existing respawn logic
+        return safeSpawnPoint(in: cameraWorldRect(margin: 400).insetBy(dx: 120, dy: 120),
+                              radius: spawnClearance)
+    }
+    
+    private func pauseWorldForGameOver() {
+        // Keep the scene responsive to touches; just stop physics & timers you own.
+        physicsWorld.speed = 0
+        isPaused = false
+        cameraFrozenPos = car.position
+    }
+}
+
+// =======================================
+// GameScene — contacts: bullets & pickups
+// =======================================
+extension GameScene {
+    // MARK: - SKPhysicsContactDelegate
+    func didBegin(_ contact: SKPhysicsContact) {
+        let a = contact.bodyA
+        let b = contact.bodyB
+        
+        @inline(__always) func isCar(_ x: SKPhysicsBody) -> Bool { (x.categoryBitMask & Category.car) != 0 }
+        @inline(__always) func isBullet(_ x: SKPhysicsBody) -> Bool { (x.categoryBitMask & Category.bullet) != 0 }
+        @inline(__always) func isObstacle(_ x: SKPhysicsBody) -> Bool { (x.categoryBitMask & Category.obstacle) != 0 }
+        @inline(__always) func isWall(_ x: SKPhysicsBody) -> Bool { (x.categoryBitMask & Category.wall) != 0 }
+        @inline(__always) func isRamp(_ x: SKPhysicsBody) -> Bool { (x.categoryBitMask & Category.ramp) != 0 }
+        @inline(__always) func isEnhancement(_ x: SKPhysicsBody) -> Bool { (x.categoryBitMask & Category.enhancements) != 0 }
+        @inline(__always) func isHill(_ x: SKPhysicsBody) -> Bool { x.node is HillNode }
+        @inline(__always) func killBullet(_ b: SKPhysicsBody) {
+            if let bn = (isBullet(a) ? a : b).node as? BulletNode {
+                bn.playImpactFX(at: contact.contactPoint, in: self)
+            }
+            b.node?.removeAllActions()
+            b.node?.removeFromParent()
+        }
+        
+        // Mark that we touched something solid this step (used by the contact-boost clamp)
+        if (isCar(a) && (isObstacle(b) || isWall(b) || isRamp(b))) ||
+            (isCar(b) && (isObstacle(a) || isWall(a) || isRamp(a))) {
+            _hadSolidContactThisStep = true
+        }
+        
+        // ─────────────────────────────────────────
+        // 1) Bullet ↔ Obstacle: apply BulletNode.damage then remove bullet
+        // ─────────────────────────────────────────
+        if (isBullet(a) && isObstacle(b)) || (isBullet(b) && isObstacle(a)) {
+            let bullet   = isBullet(a) ? a : b
+            let obstBody = isObstacle(a) ? a : b
+            
+            if let ob = obstBody.node as? ObstacleNode {
+                let hitWorld = contact.contactPoint
+                let hitLocal = ob.convert(hitWorld, from: self)
+                let dmg = (bullet.node as? BulletNode)?.damage ?? 1
+                _ = ob.applyDamage(dmg, impact: hitLocal)
+            }
+            killBullet(bullet)
+            return
+        }
+        
+        // 2) Bullet ↔ (Wall | Ramp | Hill): just remove bullet
+        if isBullet(a) && (isWall(b) || isRamp(b) || isHill(b)) { killBullet(a); return }
+        if isBullet(b) && (isWall(a) || isRamp(a) || isHill(a)) { killBullet(b); return }
+        
+        // ─────────────────────────────────────────
+        // 3) Car ↔ Enhancement: try to consume via CarNode API
+        //    (HP capped at 100, Shield capped at 100, shrink cannot re-pickup, etc.)
+        // ─────────────────────────────────────────
+        if (isCar(a) && isEnhancement(b)) || (isCar(b) && isEnhancement(a)) {
+            let enhBody = isEnhancement(a) ? a : b
+            if let node = enhBody.node as? EnhancementNode {
+                // inside: if car.applyEnhancement(node.kind) { ... }
+                if car.applyEnhancement(node.kind) {
+                    self.onPickedEnhancement(node.kind)          // ← add this
+                    let pop = SKAction.group([.scale(to: 1.25, duration: 0.08),
+                                              .fadeOut(withDuration: 0.10)])
+                    node.run(.sequence([pop, .removeFromParent()]))
+                } else {
+                    // not eligible (e.g., HP 100, Shield 100, shrink active) → little bounce
+                    node.run(.sequence([.scale(to: 1.12, duration: 0.06),
+                                        .scale(to: 1.00, duration: 0.12)]))
+                }
+            }
+            return
+        }
+        
+        // ─────────────────────────────────────────
+        // 4) Car ↔ Ramp: launch (no damage)
+        // ─────────────────────────────────────────
+        if (isCar(a) && isRamp(b)) || (isCar(b) && isRamp(a)) {
+            guard !car.isAirborne else { return }
+            let rampBody = isRamp(a) ? a : b
+            guard let ramp = rampBody.node as? RampNode else { return }
+            
+            let carHeading = car.zRotation + .pi/2
+            var align = cos(shortestAngle(from: carHeading, to: ramp.heading))
+            align = max(0, align)
+            
+            let spd = car.physicsBody?.velocity.length ?? 0
+            let spdFrac = min(1, spd / max(1, car.maxSpeed))
+            
+            let vz0 = ramp.strengthZ * max(0.72, (0.55 + 0.45 * spdFrac)) * align
+            let fwdPush = (0.35 * spd + 0.18 * vz0) * align
+            let fwdBoost = min(600, max(0, fwdPush))
+            
+            car.applyRampImpulse(vzAdd: vz0, forwardBoost: fwdBoost, heading: ramp.heading)
+            return
+        }
+        
+        // ─────────────────────────────────────────
+        // 5) Car ↔ (Obstacle | Wall): damage via CarNode (never from hills)
+        // ─────────────────────────────────────────
+        if (isCar(a) && (isObstacle(b) || isWall(b))) ||
+            (isCar(b) && (isObstacle(a) || isWall(a))) {
+            
+            let carBody = isCar(a) ? a : b
+            let other   = isCar(a) ? b : a
+            
+            if isHill(other) { return } // no damage from hills
+            (carBody.node as? CarNode)?.handleCrash(contact: contact, other: other)
+            return
+        }
+    }
+}
+
+extension GameScene {
+    
+    // MARK: - RNG → kind
+    @inline(__always)
+    private func pickEnhancementKind(rng: inout SplitMix64) -> EnhancementKind {
+        let roll = rng.unit()
+        if roll < 0.22 { return .hp20 }
+        else if roll < 0.44 { return .shield20 }
+        else if roll < 0.62 { return .weaponRapid }
+        else if roll < 0.76 { return .weaponDamage }
+        else if roll < 0.88 { return .weaponSpread }
+        else if roll < 0.94 { return .control }
+        else { return .shrink }
+    }
+    
+    // MARK: - Hills (80% chance, single open spawn near top)
+    private func maybeSpawnEnhancement(on hill: HillNode, rng: inout SplitMix64) {
+        if rng.unit() >= 0.80 { return }
+        let kind = pickEnhancementKind(rng: &rng)
+        let f = hill.calculateAccumulatedFrame()
+        let p = CGPoint(
+            x: rng.range((f.midX - f.width*0.12)...(f.midX + f.width*0.12)),
+            y: rng.range((f.midY + f.height*0.02)...(f.midY + f.height*0.16))
+        )
+        _ = placeEnhancementTracked(kind, at: p)
+    }
+    
+    // MARK: - Ground (independent rolls per chunk)
+    // 40% behind a destructible obstacle; 10% open on ground.
+    private func spawnGroundEnhancements(in rect: CGRect,
+                                         nodesOut: inout [SKNode],
+                                         cx: Int, cy: Int) {
+        
+        // ---- Behind obstacle roll (40%) ----
+        let seedBehind = hash2(cx &* 11003 ^ 0x00BEEF, cy &* 22013 ^ 0x00FACE, seed: worldSeed ^ 0x4444_1111)
+        var rngBehind = SplitMix64(seed: seedBehind)
+        
+        if rngBehind.unit() < 0.40,
+           let ob = pickDestructibleObstacle(in: rect, rng: &rngBehind) {
+            
+            // Full ignore set: entire subtree + ancestor wrappers up to obstacleRoot
+            let ignore = Array(subtreeSet(of: ob))
+            
+            if let p = pointBehindObstacle(ob,
+                                           anchor: car.position,
+                                           rng: &rngBehind,
+                                           ignoring: ignore),
+               let n = placeEnhancementTracked(pickEnhancementKind(rng: &rngBehind),
+                                               at: p,
+                                               ignoring: ignore) {
+                nodesOut.append(n)
+            }
+        }
+        
+        // ---- Open-ground roll (10%) ----
+        let seedOpen = hash2(cx &* 91079 ^ 0x00CAFE, cy &* 67819 ^ 0x00BEEF, seed: worldSeed ^ 0x9999_AAAA)
+        var rngOpen = SplitMix64(seed: seedOpen)
+        
+        if rngOpen.unit() < 0.10,
+           let p = randomOpenPoint(in: rect, rng: &rngOpen),
+           let n = placeEnhancementTracked(pickEnhancementKind(rng: &rngOpen), at: p) {
+            nodesOut.append(n)
+        }
+    }
+    
+    // MARK: - Pick an obstacle (physics-first, frame-fallback)
+    // Any node with Category.obstacle counts. Optional soft filters.
+    private func pickDestructibleObstacle(in rect: CGRect,
+                                          rng: inout SplitMix64) -> SKNode? {
+        // Try physics bodies first
+        var bodies: [SKPhysicsBody] = []
+        physicsWorld.enumerateBodies(in: rect.insetBy(dx: 24, dy: 24)) { body, _ in
+            guard (body.categoryBitMask & Category.obstacle) != 0 else { return }
+            guard let n = body.node else { return }
+            if let d = n.userData?["destructible"] as? Bool, d == false { return }
+            if let name = n.name?.lowercased(), name.contains("steel") { return }
+            bodies.append(body)
+        }
+        
+        if !bodies.isEmpty {
+            let cx = rect.midX, cy = rect.midY
+            let sorted = bodies.sorted {
+                let a = $0.node!.position, b = $1.node!.position
+                return hypot(a.x - cx, a.y - cy) < hypot(b.x - cx, b.y - cy)
+            }
+            let take = min(sorted.count, 8)
+            return sorted[rng.int(0...(take - 1))].node
+        }
+        
+        // Fallback: search obstacleRoot by frames (covers obstacles lacking category/multiple bodies)
+        var candidates: [SKNode] = []
+        obstacleRoot.enumerateChildNodes(withName: "//*") { n, _ in
+            let fr = n.calculateAccumulatedFrame()
+            if !fr.intersects(rect.insetBy(dx: 24, dy: 24)) { return }
+            if let d = n.userData?["destructible"] as? Bool, d == false { return }
+            if let name = n.name?.lowercased(), name.contains("steel") { return }
+            candidates.append(n)
+        }
+        guard !candidates.isEmpty else { return nil }
+        
+        let cx = rect.midX, cy = rect.midY
+        candidates.sort {
+            hypot($0.position.x - cx, $0.position.y - cy)
+            < hypot($1.position.x - cx, $1.position.y - cy)
+        }
+        return candidates[rng.int(0...min(7, candidates.count - 1))]
+    }
+    
+    // MARK: - Find a point *behind* the obstacle (ray → frame → sweep)
+    private func pointBehindObstacle(_ ob: SKNode,
+                                     anchor: CGPoint,
+                                     rng: inout SplitMix64,
+                                     ignoring ignoreNodes: [SKNode] = []) -> CGPoint? {
+        let ignoreSet = Set(ignoreNodes)
+        
+        // World-ish center of obstacle
+        let obWorld = ob.convert(CGPoint.zero, to: self)
+        
+        // Unit direction car → obstacle (and lateral)
+        var dir = CGVector(dx: obWorld.x - anchor.x, dy: obWorld.y - anchor.y)
+        let len = max(0.001, hypot(dir.dx, dir.dy))
+        dir.dx /= len; dir.dy /= len
+        let sx = -dir.dy, sy = dir.dx
+        
+        // Raycast segment
+        let maxRay: CGFloat = 2400
+        let start = CGPoint(x: anchor.x - dir.dx * 6, y: anchor.y - dir.dy * 6)
+        let end   = CGPoint(x: anchor.x + dir.dx * maxRay, y: anchor.y + dir.dy * maxRay)
+        
+        // Tunables
+        let baseGap: CGFloat = 64
+        let attempts = 10
+        let avoid: UInt32 = Category.wall | Category.obstacle | Category.hole | Category.ramp | Category.enhancements
+        
+        // 1) Precise ray hit on anything in the obstacle's subtree
+        if let hit = rayHitPoint(on: ob, start: start, end: end) {
+            for step in 0..<attempts {
+                let extra = CGFloat(step) * 10
+                let lat   = rng.range(-18...18)
+                let p = CGPoint(x: hit.x + dir.dx * (baseGap + extra) + sx * lat,
+                                y: hit.y + dir.dy * (baseGap + extra) + sy * lat)
+                if worldBounds.contains(p),
+                   clearanceOK(at: p, radius: 24, mask: avoid, ignoring: ignoreSet) {
+                    return p
+                }
+            }
+        }
+        
+        // 2) Frame-radius fallback
+        let fr  = ob.calculateAccumulatedFrame()
+        let rad = 0.5 * max(fr.width, fr.height)
+        for step in 0..<attempts {
+            let extra = CGFloat(step) * 12
+            let lat   = rng.range(-20...20)
+            let p = CGPoint(x: fr.midX + dir.dx * (rad + baseGap + extra) + sx * lat,
+                            y: fr.midY + dir.dy * (rad + baseGap + extra) + sy * lat)
+            if worldBounds.contains(p),
+               clearanceOK(at: p, radius: 24, mask: avoid, ignoring: ignoreSet) {
+                return p
+            }
+        }
+        
+        // 3) Progressive sweep further out (more forgiving)
+        let sweepSteps = 24
+        for step in 0..<sweepSteps {
+            let out = baseGap + CGFloat(step) * 16
+            let lat = rng.range(-24...24)
+            let p = CGPoint(x: obWorld.x + dir.dx * (rad + out) + sx * lat,
+                            y: obWorld.y + dir.dy * (rad + out) + sy * lat)
+            if worldBounds.contains(p),
+               clearanceOK(at: p, radius: 24, mask: avoid, ignoring: ignoreSet) {
+                return p
+            }
+        }
+        
+        return nil
+    }
+    
+    // MARK: - Raycast helper (closest hit on target's subtree)
+    private func rayHitPoint(on target: SKNode, start: CGPoint, end: CGPoint) -> CGPoint? {
+        var best: (dist: CGFloat, point: CGPoint)?
+        physicsWorld.enumerateBodies(alongRayStart: start, end: end) { body, point, _, _ in
+            guard (body.categoryBitMask & Category.obstacle) != 0 else { return }
+            guard let n = body.node else { return }
+            guard n.inParentHierarchy(target) || target.inParentHierarchy(n) else { return }
+            let d = hypot(point.x - start.x, point.y - start.y)
+            if best == nil || d < best!.dist { best = (d, point) }
+        }
+        return best?.point
+    }
+    
+    // MARK: - Open ground sampler
+    private func randomOpenPoint(in rect: CGRect, rng: inout SplitMix64) -> CGPoint? {
+        let avoid: UInt32 = Category.wall | Category.obstacle | Category.hole | Category.ramp | Category.enhancements
+        for _ in 0..<24 {
+            let p = CGPoint(x: rng.range(rect.minX...rect.maxX),
+                            y: rng.range(rect.minY...rect.maxY))
+            if worldBounds.contains(p),
+               clearanceOK(at: p, radius: 30, mask: avoid) {
+                var onHill = false
+                for hill in hills where hill.parent != nil {
+                    if hill.calculateAccumulatedFrame().insetBy(dx: -16, dy: -16).contains(p) { onHill = true; break }
+                }
+                if !onHill { return p }
+            }
+        }
+        return nil
+    }
+    
+    // MARK: - Place enhancement (with ignore threading)
+    @discardableResult
+    private func placeEnhancementTracked(_ kind: EnhancementKind,
+                                         at p: CGPoint,
+                                         ignoring ignore: [SKNode] = []) -> EnhancementNode? {
+        let avoidMask: UInt32 = Category.wall | Category.obstacle | Category.ramp | Category.hole | Category.enhancements
+        guard clearanceOK(at: p, radius: 24, mask: avoidMask, ignoring: Set(ignore)) else { return nil }
+        
+        let n = EnhancementNode(kind: kind)
+        n.position = p
+        n.zPosition = 3
+        obstacleRoot.addChild(n)
+        if let pb = n.physicsBody {
+            pb.categoryBitMask = Category.enhancements
+            pb.collisionBitMask = 0
+            pb.contactTestBitMask = Category.car
+            pb.isDynamic = false
+        }
+        return n
+    }
+    
+    // MARK: - Helper: full subtree + ancestor wrappers (for ignore set)
+    private func subtreeSet(of root: SKNode) -> Set<SKNode> {
+        var out: Set<SKNode> = [root]
+        root.enumerateChildNodes(withName: "//*") { node, _ in out.insert(node) }
+        var a = root.parent
+        while let n = a, n !== obstacleRoot, n !== self {
+            out.insert(n); a = n.parent
+        }
+        return out
+    }
+    
+    // (Optional) quick debug breadcrumbs — comment out in production
+#if DEBUG
+    private func debugDot(_ p: CGPoint, _ c: UIColor) {
+        let d = SKShapeNode(circleOfRadius: 4)
+        d.position = p
+        d.fillColor = c
+        d.strokeColor = .clear
+        d.zPosition = 9999
+        addChild(d)
+        d.run(.sequence([.wait(forDuration: 3), .fadeOut(withDuration: 0.2), .removeFromParent()]))
+    }
+#endif
+}
+
+// Additions to GameScene to wire in EnhancementHUDNode
+// - Create property `enhHUD`
+// - Place it in didMove(to:)
+// - Re-place on didChangeSize(_:)
+// - Tick in update(_:)
+// - Handle Car ↔ Enhancement pickup in didBegin(_:) and show HUD
+// GameScene+EnhancementsHUD.swift
+// Glue between pickups / CarNode state and EnhancementHUDNode.
+
+extension GameScene {
+    
+    // 1) Call from didChangeSize (or wherever you already lay out HUD)
+    func reflowEnhancementHUD() {
+        enhancementHUD.place(in: size)
+    }
+    
+    // 2) Tick from update(_:)
+    func stepEnhancementHUD(_ dt: CGFloat) {
+        enhancementHUD.step(dt)
+    }
+    
+    
+    func updateHealthHUD() {
+        healthHUD.set(hp: car.hp, maxHP: car.maxHP, shield: car.shield)
+    }
+    
+    // 3) Call this right after a pickup is successfully applied to the car
+    //    (i.e., after your game logic decides it can be taken).
+    func onPickedEnhancement(_ kind: EnhancementKind) {
+        switch kind {
+            
+        case .hp20:
+            // HP is not persistent in the HUD — show a toast only.
+            enhancementHUD.flashToast("HP +20", tint: .systemGreen)
+            
+        case .shield20:
+            if car.shield < 100 {
+                enhancementHUD.setPersistent(.shield20, active: true)
+                enhancementHUD.flashToast("Shield +20", tint: .systemBlue)
+                updateHealthHUD()
+            }
+            
+        case .weaponRapid:
+            // Only one weapon mod at a time.
+            enhancementHUD.setPersistent(.weaponRapid,  active: true)
+            enhancementHUD.setPersistent(.weaponDamage, active: false)
+            enhancementHUD.setPersistent(.weaponSpread, active: false)
+            enhancementHUD.flashToast("Rapid Fire!", tint: .systemYellow)
+            
+        case .weaponDamage:
+            enhancementHUD.setPersistent(.weaponRapid,  active: false)
+            enhancementHUD.setPersistent(.weaponDamage, active: true)
+            enhancementHUD.setPersistent(.weaponSpread, active: false)
+            enhancementHUD.flashToast("Damage Boost!", tint: .systemOrange)
+            
+        case .weaponSpread:
+            enhancementHUD.setPersistent(.weaponRapid,  active: false)
+            enhancementHUD.setPersistent(.weaponDamage, active: false)
+            enhancementHUD.setPersistent(.weaponSpread, active: true)
+            enhancementHUD.flashToast("Spread Shot!", tint: .systemPurple)
+            
+        case .control:
+            // Non-stacking, persistent badge.
+            enhancementHUD.setPersistent(.control, active: true)
+            enhancementHUD.flashToast("Control Boost", tint: .systemTeal)
+            
+        case .shrink:
+            // Non-stacking, persistent badge.
+            enhancementHUD.setPersistent(.shrink, active: true)
+            enhancementHUD.flashToast("Mini Mode!", tint: .magenta)
+            
+        @unknown default:
+            break
+        }
+    }
+    
+    // Optional helper if you want to wipe the HUD on death/respawn.
+    // (CarNode.resetEnhancements() will flip internal state; this
+    // simply clears any leftover badges immediately.)
+    func clearEnhancementBadges() {
+        enhancementHUD.clearAll()
+    }
+}
+
+// Keep HUD in sync with CarNode state changes that don’t come directly
+// from a pickup (e.g., death/reset, shield consumed, etc.).
+extension GameScene: CarShieldReporting, CarWeaponReporting, CarStatusReporting {
+    
+    // Called by CarNode whenever shield value changes.
+    func onShieldChanged(_ value: Int) {
+        enhancementHUD.setPersistent(.shield20, active: value > 0)
+        updateHealthHUD()
+    }
+    
+    // Called by CarNode whenever weapon mode changes (including reset).
+    func onWeaponChanged(_ name: String) {
+        switch car.weaponMod {
+        case .rapid:
+            enhancementHUD.setPersistent(.weaponRapid,  active: true)
+            enhancementHUD.setPersistent(.weaponDamage, active: false)
+            enhancementHUD.setPersistent(.weaponSpread, active: false)
+        case .damage:
+            enhancementHUD.setPersistent(.weaponRapid,  active: false)
+            enhancementHUD.setPersistent(.weaponDamage, active: true)
+            enhancementHUD.setPersistent(.weaponSpread, active: false)
+        case .spread:
+            enhancementHUD.setPersistent(.weaponRapid,  active: false)
+            enhancementHUD.setPersistent(.weaponDamage, active: false)
+            enhancementHUD.setPersistent(.weaponSpread, active: true)
+        default:
+            enhancementHUD.setPersistent(.weaponRapid,  active: false)
+            enhancementHUD.setPersistent(.weaponDamage, active: false)
+            enhancementHUD.setPersistent(.weaponSpread, active: false)
+        }
+    }
+    
+    func onControlBoostChanged(_ active: Bool) {
+        enhancementHUD.setPersistent(.control, active: active)
+    }
+    
+    func onMiniModeChanged(_ active: Bool) {
+        enhancementHUD.setPersistent(.shrink, active: active)
+        
+        let target: CGFloat = active ? 0.9 : 1.0
+        car.removeAction(forKey: "miniScale")
+        let scale = SKAction.scale(to: target, duration: 0.18)
+        scale.timingMode = .easeOut
+        car.run(scale, withKey: "miniScale")
+        
+        // pulse once when enabling
+        car.removeAction(forKey: "miniPulse")
+        if active {
+            playShrinkPoof(at: car.position)
+            let up = SKAction.scale(to: target * 1.08, duration: 0.18)
+            up.timingMode = .easeOut
+            let dn = SKAction.scale(to: target, duration: 0.16)
+            dn.timingMode = .easeIn
+            car.run(.sequence([up, dn]), withKey: "miniPulse")
+        }
+    }
+}
+
+extension GameScene {
+    func playShrinkPoof(at p: CGPoint) {
+        let r: CGFloat = 36
+        let ring = SKShapeNode(circleOfRadius: r)
+        ring.position = p
+        ring.strokeColor = UIColor.white.withAlphaComponent(0.75)
+        ring.fillColor = .clear
+        ring.lineWidth = 2
+        ring.glowWidth = 4
+        addChild(ring)
+        ring.run(.sequence([
+            .group([.scale(to: 1.35, duration: 0.22), .fadeAlpha(to: 0, duration: 0.22)]),
+            .removeFromParent()
+        ]))
+    }
+}
+
+extension GameScene {
+    
+    // MARK: glyph nodes
+    private var weaponGlyph: SKShapeNode {
+        if let n = fireButton.childNode(withName: "_weaponGlyph") as? SKShapeNode {
+            return n
+        }
+        let n = SKShapeNode()
+        n.name = "_weaponGlyph"
+        n.zPosition = fireButton.zPosition + 1
+        n.strokeColor = .clear
+        n.fillColor = .white
+        fireButton.addChild(n)
+        layoutWeaponGlyph()
+        return n
+    }
+    
+    func buildWeaponGlyph() {
+        _ = weaponGlyph // ensure exists
+        refreshWeaponGlyph()
+    }
+    
+    func layoutWeaponGlyph() {
+        guard let n = fireButton.childNode(withName: "_weaponGlyph") as? SKShapeNode else { return }
+        // 18×18 icon at top-left of button
+        let r: CGFloat = 9
+        n.path = CGPath(ellipseIn: CGRect(x: -r, y: -r, width: r*2, height: r*2), transform: nil)
+        n.position = CGPoint(x: -28, y: 28)
+    }
+    
+    func refreshWeaponGlyph() {
+        guard let n = fireButton.childNode(withName: "_weaponGlyph") as? SKShapeNode else { return }
+        
+        switch car.weaponMod {
+        case .rapid:
+            n.fillColor = .systemYellow
+            n.path = CGPath(ellipseIn: CGRect(x: -9, y: -9, width: 18, height: 18), transform: nil)
+            
+        case .damage:
+            // triangle
+            let p = CGMutablePath()
+            p.move(to: CGPoint(x: 0, y: 10))
+            p.addLine(to: CGPoint(x: 8, y: -8))
+            p.addLine(to: CGPoint(x: -8, y: -8))
+            p.closeSubpath()
+            n.path = p
+            n.fillColor = .systemOrange
+            
+        case .spread:
+            // three dots
+            let p = CGMutablePath()
+            for x in [-6, 0, 6] {
+                p.addEllipse(in: CGRect(x: x-2, y: -2, width: 4, height: 4))
+            }
+            n.path = p
+            n.fillColor = .systemPurple
+            
+        default:
+            n.fillColor = .white
+            n.path = CGPath(ellipseIn: CGRect(x: -9, y: -9, width: 18, height: 18), transform: nil)
+        }
     }
 }
 

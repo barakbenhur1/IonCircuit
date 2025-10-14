@@ -9,13 +9,14 @@ import SpriteKit
 
 // Bit masks as plain UInt32 constants (easy to use with SpriteKit)
 enum Category {
-    static let car: UInt32        = 1 << 0
-    static let wall: UInt32       = 1 << 1
-    static let obstacle: UInt32   = 1 << 2
-    static let hole: UInt32       = 1 << 3
-    static let checkpoint: UInt32 = 1 << 4
-    static let ramp: UInt32       = 1 << 5
-    static let bullet: UInt32     = 1 << 6
+    static let car: UInt32          = 1 << 0
+    static let wall: UInt32         = 1 << 1
+    static let obstacle: UInt32     = 1 << 2
+    static let hole: UInt32         = 1 << 3
+    static let checkpoint: UInt32   = 1 << 4
+    static let ramp: UInt32         = 1 << 5
+    static let bullet: UInt32       = 1 << 6
+    static let enhancements: UInt32 = 1 << 7
 }
 
 func shortestAngle(from a: CGFloat, to b: CGFloat) -> CGFloat {
@@ -41,6 +42,10 @@ extension CGVector {
     func scaled(_ k: CGFloat) -> CGVector { .init(dx: dx*k, dy: dy*k) }
     static func +(l: CGVector, r: CGVector) -> CGVector { .init(dx: l.dx+r.dx, dy: l.dy+r.dy) }
     static func -(l: CGVector, r: CGVector) -> CGVector { .init(dx: l.dx-r.dx, dy: l.dy-r.dy) }
+    var normalized: CGVector {
+        let L = max(1e-9, length)
+        return CGVector(dx: dx / L, dy: dy / L)
+    }
 }
 
 // Convenience
