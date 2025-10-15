@@ -55,8 +55,8 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     private let ringHandle = SKShapeNode()
     private let activeHalo = SKShapeNode()
     
-    private let baseInnerR: CGFloat = 34
-    private let baseOuterR: CGFloat = 124
+    private let baseInnerR: CGFloat = 14
+    private let baseOuterR: CGFloat = 88
     private let ringAlphaOnTouch: CGFloat = 0.16
     private let ringAlphaIdle: CGFloat = 0.0
     private let ringPalette: [UIColor] = [.white, .systemGreen, .systemYellow, .systemOrange, .systemRed]
@@ -103,6 +103,24 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     private let fireButton = SKNode()
     private let fireBase = SKShapeNode()
     private let fireIcon = SKShapeNode()
+    // Fire button colors (idle/active)
+    private let fireIdleColor  = UIColor(red: 0.95, green: 0.18, blue: 0.25, alpha: 0.90)
+    private let fireActiveColor = UIColor(red: 1.00, green: 0.42, blue: 0.15, alpha: 0.98)
+    
+    // ==== DRIVE BUTTON (movement) — NEW =======================================
+    private let driveButton = SKNode()
+    private let driveBase = SKShapeNode()
+    private let driveIcon = SKShapeNode()   // container for arrows
+    
+    // Per-direction arrow nodes (so we can color individually)
+    private let driveArrowUp = SKShapeNode()
+    private let driveArrowDown = SKShapeNode()
+    private let driveArrowLeft = SKShapeNode()
+    private let driveArrowRight = SKShapeNode()
+    private let driveArrowInactive = UIColor.white.withAlphaComponent(0.55)
+    
+    private let controlButtonRadius: CGFloat = 40   // SAME as fire button (unpressed)
+    // ==========================================================================
     
     private var driveTouch: UITouch?
     private var fireTouch: UITouch?
@@ -139,7 +157,6 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     private var hills: [HillNode] = []
     
     // UI / HUD
-    // UI / HUD
     private let healthHUD = CarHealthHUDNode()
     private let enhancementHUD = EnhancementHUDNode()
     private let gameOverOverlay = GameOverOverlayNode()
@@ -165,6 +182,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         isTouching = false
         controlArmed = false
         car.stopAutoFire()
+        setFiring(false)              // ← ensure fire color resets
         hideRing()
         
         // freeze simulation
@@ -293,6 +311,11 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         cam.addChild(fireButton)
         placeFireButton()
         
+        // DRIVE button — NEW
+        buildDriveButton()
+        cam.addChild(driveButton)
+        placeDriveButton()
+        
         placeHUD()
         
         // Health HUD
@@ -319,18 +342,18 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         
         // After you create the camera node `cam`
         cam.addChild(gameOverOverlay)
-
+        
         // restart handler
         gameOverOverlay.onRestart = { [weak self] in
             guard let self = self else { return }
             self.gameOverOverlay.hide()
-
+            
             // get a safe spawn in the camera’s visible area
             let spawn = self.safeSpawnPoint(
                 in: self.cameraWorldRect(margin: 400).insetBy(dx: 120, dy: 120),
                 radius: self.spawnClearance
             )
-
+            
             // reset the car + world
             self.car.restartAfterGameOver(at: spawn)
             self.cameraFrozenPos = nil
@@ -353,8 +376,9 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         handednessOverlay = ov
         camera?.addChild(ov)
         ov.onPick = { [weak self] left in
-            guard let self else { return }
+            guard let self = self else { return }
             self.isLeftHanded = left
+            self.placeDriveButton()
             self.placeFireButton()
         }
     }
@@ -363,6 +387,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         super.didChangeSize(oldSize)
         placeHUD()
         placeFireButton()
+        placeDriveButton()
         handednessOverlay?.updateSize(size)
         reflowEnhancementHUD()
     }
@@ -921,7 +946,27 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
             if fireTouch == nil, pointInsideFireButton(pCam) {
                 fireTouch = t
                 car.startAutoFire(on: self)
+                setFiring(true)                 // ← color ON
                 animateFireTap()
+                continue
+            }
+            
+            // NEW: Drive button press → center ring on the button
+            if driveTouch == nil, pointInsideDriveButton(pCam) {
+                driveTouch = t
+                isTouching = true
+                controlArmed = true
+                isCoasting = false
+                fingerCam = pCam
+                hasAngleLP = true
+                angleLP = car.zRotation + .pi/2
+                lockAngleUntilExitDeadzone = true
+                
+                ringGroup.position = driveButton.position  // center ring at drive button
+                showRing()
+                ringHandle.position = .zero
+                animateDriveTap()
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 continue
             }
             
@@ -938,6 +983,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
                     angleLP = car.zRotation + .pi/2
                     lockAngleUntilExitDeadzone = true
                     
+                    ringGroup.position = .zero // center at camera origin for this legacy mode
                     showRing()
                     ringHandle.position = .zero
                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
@@ -955,7 +1001,9 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
             fingerCam = dt.location(in: cam)
             guard controlArmed, let f = fingerCam else { return }
             
-            let v = CGVector(dx: f.x, dy: f.y)
+            // Measure from where the ring actually lives (can be drive button pos)
+            let origin = ringGroup.position
+            let v = CGVector(dx: f.x - origin.x, dy: f.y - origin.y)
             let dRaw = hypot(v.dx, v.dy)
             let (innerR, outerR) = currentRadii()
             let dClamp = CGFloat.clamp(dRaw, innerR, outerR)
@@ -979,6 +1027,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
             if let ft = fireTouch, t === ft {
                 fireTouch = nil
                 car.stopAutoFire()
+                setFiring(false)         // ← color OFF
             }
             if let dt = driveTouch, t === dt {
                 driveTouch = nil
@@ -987,6 +1036,9 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
                 fingerCam = nil
                 hideRing()
                 isCoasting = true
+                // Reset drive arrows when ring hidden / no input
+                setDriveArrowColors(up: false, down: false, left: false, right: false,
+                                    highlight: .systemTeal)
             }
         }
     }
@@ -1032,7 +1084,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         
         let R: CGFloat = 40
         fireBase.path = CGPath(ellipseIn: CGRect(x: -R, y: -R, width: R*2, height: R*2), transform: nil)
-        fireBase.fillColor = UIColor(red: 0.95, green: 0.18, blue: 0.25, alpha: 0.90)
+        fireBase.fillColor = fireIdleColor
         fireBase.strokeColor = UIColor.white.withAlphaComponent(0.18)
         fireBase.lineWidth = 1.5
         fireBase.glowWidth = 2
@@ -1074,6 +1126,115 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         fireButton.run(.sequence([down, up]), withKey: "press")
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }
+    
+    private func setFiring(_ active: Bool) {
+        fireBase.removeAction(forKey: "firePulse")
+        if active {
+            fireBase.fillColor = fireActiveColor
+            fireBase.strokeColor = UIColor.white.withAlphaComponent(0.28)
+            // subtle pulse while firing
+            let up = SKAction.scale(to: 1.05, duration: 0.12); up.timingMode = .easeOut
+            let dn = SKAction.scale(to: 1.00, duration: 0.12); dn.timingMode = .easeIn
+            fireButton.run(.repeatForever(.sequence([up, dn])), withKey: "firePulse")
+        } else {
+            fireBase.fillColor = fireIdleColor
+            fireBase.strokeColor = UIColor.white.withAlphaComponent(0.18)
+            fireButton.removeAction(forKey: "firePulse")
+            fireButton.setScale(1.0)
+        }
+    }
+    
+    // MARK: - DRIVE BUTTON (movement)
+    private func buildDriveButton() {
+        driveButton.zPosition = 500
+        
+        let R = controlButtonRadius // SAME size as fire button (unpressed)
+        driveBase.path = CGPath(ellipseIn: CGRect(x: -R, y: -R, width: R*2, height: R*2), transform: nil)
+        driveBase.fillColor = UIColor(white: 0.12, alpha: 0.90)
+        driveBase.strokeColor = UIColor.white.withAlphaComponent(0.18)
+        driveBase.lineWidth = 1.5
+        driveBase.glowWidth = 2
+        if driveBase.parent == nil { driveButton.addChild(driveBase) }
+        
+        // Use driveIcon as a container (no own path)
+        driveIcon.path = nil
+        driveIcon.strokeColor = .clear
+        driveIcon.fillColor = .clear
+        if driveIcon.parent == nil { driveButton.addChild(driveIcon) }
+        
+        // Shared geometry for arrows
+        func arrowPath(dir: String) -> CGPath {
+            let p = CGMutablePath()
+            let shaft: CGFloat = 10   // straight segment from center
+            let len: CGFloat   = 16   // total length to arrow tip
+            let head: CGFloat  = 5    // arrowhead size
+            let wing: CGFloat  = head * 0.6
+            
+            switch dir {
+            case "up":
+                p.move(to: CGPoint(x: 0, y: shaft))
+                p.addLine(to: CGPoint(x: 0, y: len))
+                p.move(to: CGPoint(x: 0, y: len))
+                p.addLine(to: CGPoint(x: -wing, y: len - head))
+                p.move(to: CGPoint(x: 0, y: len))
+                p.addLine(to: CGPoint(x:  wing, y: len - head))
+            case "down":
+                p.move(to: CGPoint(x: 0, y: -shaft))
+                p.addLine(to: CGPoint(x: 0, y: -len))
+                p.move(to: CGPoint(x: 0, y: -len))
+                p.addLine(to: CGPoint(x: -wing, y: -len + head))
+                p.move(to: CGPoint(x: 0, y: -len))
+                p.addLine(to: CGPoint(x:  wing, y: -len + head))
+            case "left":
+                p.move(to: CGPoint(x: -shaft, y: 0))
+                p.addLine(to: CGPoint(x: -len, y: 0))
+                p.move(to: CGPoint(x: -len, y: 0))
+                p.addLine(to: CGPoint(x: -len + head, y:  wing))
+                p.move(to: CGPoint(x: -len, y: 0))
+                p.addLine(to: CGPoint(x: -len + head, y: -wing))
+            default: // "right"
+                p.move(to: CGPoint(x: shaft, y: 0))
+                p.addLine(to: CGPoint(x: len, y: 0))
+                p.move(to: CGPoint(x: len, y: 0))
+                p.addLine(to: CGPoint(x: len - head, y:  wing))
+                p.move(to: CGPoint(x: len, y: 0))
+                p.addLine(to: CGPoint(x: len - head, y: -wing))
+            }
+            return p
+        }
+        
+        // Prepare each arrow node once
+        func style(_ n: SKShapeNode, path: CGPath) {
+            n.path = path
+            n.strokeColor = driveArrowInactive
+            n.lineWidth = 2
+            n.lineCap = .round
+            n.lineJoin = .round
+            n.fillColor = .clear
+            if n.parent == nil { driveIcon.addChild(n) }
+        }
+        
+        style(driveArrowUp,    path: arrowPath(dir: "up"))
+        style(driveArrowDown,  path: arrowPath(dir: "down"))
+        style(driveArrowLeft,  path: arrowPath(dir: "left"))
+        style(driveArrowRight, path: arrowPath(dir: "right"))
+        
+        // start dim
+        setDriveArrowColors(up: false, down: false, left: false, right: false, highlight: .systemTeal)
+    }
+    
+    private func pointInsideDriveButton(_ pCam: CGPoint) -> Bool {
+        let local = CGPoint(x: pCam.x - driveButton.position.x, y: pCam.y - driveButton.position.y)
+        return hypot(local.x, local.y) <= (controlButtonRadius + 4)
+    }
+    
+    private func animateDriveTap() {
+        driveButton.removeAction(forKey: "press")
+        let down = SKAction.scale(to: 0.94, duration: 0.05)
+        let up   = SKAction.scale(to: 1.00, duration: 0.08)
+        driveButton.run(.sequence([down, up]), withKey: "press")
+    }
+    // --------------------------------------------------------------------------
     
     private func hash2(_ x: Int, _ y: Int, seed: UInt64) -> UInt64 {
         var h = seed &+ UInt64(bitPattern: Int64(x)) &* 0x9E3779B97F4A7C15
@@ -1273,7 +1434,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     // MARK: - Placement utilities
     
     // MARK: - Placement utilities
-
+    
     @discardableResult
     private func clearanceOK(
         at p: CGPoint,
@@ -1283,18 +1444,18 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     ) -> Bool {
         var blocked = false
         let box = CGRect(x: p.x - radius, y: p.y - radius, width: radius * 2, height: radius * 2)
-
+        
         physicsWorld.enumerateBodies(in: box) { body, stop in
             // only consider masked bodies
             guard (body.categoryBitMask & mask) != 0 else { return }
-
+            
             // skip the explicitly ignored nodes (and anything inside them)
             if let n = body.node {
                 if ignoreSet.contains(where: { n === $0 || n.inParentHierarchy($0) || $0.inParentHierarchy(n) }) {
                     return
                 }
             }
-
+            
             // filter out AABB-only overlaps that don't actually touch our circle
             if let n = body.node {
                 let fr = n.calculateAccumulatedFrame()
@@ -1302,11 +1463,11 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
                     return
                 }
             }
-
+            
             blocked = true
             stop.pointee = true
         }
-
+        
         return !blocked
     }
     
@@ -1575,14 +1736,23 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         rampArrow.addChild(rampArrowHead)
     }
     
-    // Flip placement by chosen hand
+    // Fire on the opposite side of Drive
     private func placeFireButton() {
-        let margin: CGFloat = 20
+        let margin: CGFloat = 80
         let R: CGFloat = 40
         let x = isLeftHanded
-        ? (-size.width * 0.5 + margin + R)
-        : ( size.width * 0.5 - margin - R)
+        ? ( size.width * 0.5 - margin - R + 15)   // Left-handed → Fire RIGHT
+        : (-size.width * 0.5 + margin + R - 15)   // Right-handed → Fire LEFT
         fireButton.position = CGPoint(x: x, y: -size.height * 0.5 + margin + R)
+    }
+    
+    private func placeDriveButton() {
+        let margin: CGFloat = 80
+        let R: CGFloat = 40
+        let x = isLeftHanded
+        ? (-size.width * 0.5 + margin + R - 15)   // Left-handed → Drive LEFT
+        : ( size.width * 0.5 - margin - R + 15)   // Right-handed → Drive RIGHT
+        driveButton.position = CGPoint(x: x, y: -size.height * 0.5 + margin + R)
     }
     
     // MARK: - Update
@@ -1617,7 +1787,9 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         if !car.isDead, isTouching, controlArmed, let f = fingerCam, let pb = car.physicsBody {
             isCoasting = false
             
-            let vFinger = CGVector(dx: f.x, dy: f.y)
+            // Measure from the ring’s current center (drive button or camera)
+            let origin = ringGroup.position
+            let vFinger = CGVector(dx: f.x - origin.x, dy: f.y - origin.y)
             let dRaw    = hypot(vFinger.dx, vFinger.dy)
             let (innerR, outerR) = currentRadii()
             let dClamped = CGFloat.clamp(dRaw, innerR, outerR)
@@ -1695,6 +1867,9 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
             }
             // === END DRIVING LOGIC ===
             
+            // Drive arrows highlight based on finger direction
+            updateDriveArrows(fromInput: vFinger, tNorm: tNorm, activeBand: idx)
+            
         } else if isCoasting && !car.isDead {
             let speed = car.physicsBody?.velocity.length ?? 0
             if speed < 8 {
@@ -1708,12 +1883,16 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
                 car.steer = 0.001
             }
             car.speedCapBonus = 0
+            // Dim arrows during coasting (no input)
+            setDriveArrowColors(up: false, down: false, left: false, right: false, highlight: .systemTeal)
         } else {
             car.throttle = 0
             car.steer = 0
             hasAngleLP = false
             lockAngleUntilExitDeadzone = false
             car.speedCapBonus = 0
+            // No input → dim arrows
+            setDriveArrowColors(up: false, down: false, left: false, right: false, highlight: .systemTeal)
         }
         
         // Keep the vertical axis in sync with terrain (smooth hill profile)
@@ -2077,7 +2256,7 @@ extension GameScene: CarNodeDelegate {
     private func freezeCamera(at pos: CGPoint) {
         cameraFrozenPos = pos      // uses your existing property
     }
-
+    
     func carNodeRequestRespawnPoint(_ car: CarNode) -> CGPoint {
         // your existing respawn logic
         return safeSpawnPoint(in: cameraWorldRect(margin: 400).insetBy(dx: 120, dy: 120),
@@ -2580,7 +2759,7 @@ extension GameScene: CarShieldReporting, CarWeaponReporting, CarStatusReporting 
     }
     
     func onMiniModeChanged(_ active: Bool) {
-        enhancementHUD.setPersistent(.shrink, active: active)
+        enhancementHUD.setPersistent(.shrink, active: true)
         
         let target: CGFloat = active ? 0.9 : 1.0
         car.removeAction(forKey: "miniScale")
@@ -2682,3 +2861,31 @@ extension GameScene {
     }
 }
 
+// ===== Drive arrow color helpers =====
+extension GameScene {
+    private func setDriveArrowColors(up: Bool, down: Bool, left: Bool, right: Bool, highlight: UIColor) {
+        let hc = highlight.withAlphaComponent(0.95)
+        driveArrowUp.strokeColor    = up    ? hc : driveArrowInactive
+        driveArrowDown.strokeColor  = down  ? hc : driveArrowInactive
+        driveArrowLeft.strokeColor  = left  ? hc : driveArrowInactive
+        driveArrowRight.strokeColor = right ? hc : driveArrowInactive
+    }
+    
+    private func updateDriveArrows(fromInput v: CGVector, tNorm: CGFloat, activeBand: Int) {
+        guard tNorm > 0.05, v.dx.isFinite, v.dy.isFinite else {
+            let c = (activeBand >= 0 && activeBand < ringPalette.count) ? ringPalette[activeBand] : .systemTeal
+            setDriveArrowColors(up: false, down: false, left: false, right: false, highlight: c)
+            return
+        }
+        let mag = max(1e-6, hypot(v.dx, v.dy))
+        let nx = v.dx / mag, ny = v.dy / mag
+        let thresh: CGFloat = 0.35
+        let up    = ny >  thresh
+        let down  = ny < -thresh
+        let right = nx >  thresh
+        let left  = nx < -thresh
+        
+        let c = (activeBand >= 0 && activeBand < ringPalette.count) ? ringPalette[activeBand] : .systemTeal
+        setDriveArrowColors(up: up, down: down, left: left, right: right, highlight: c)
+    }
+}
