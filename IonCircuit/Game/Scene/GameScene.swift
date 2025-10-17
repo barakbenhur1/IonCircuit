@@ -492,7 +492,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         case .began:
             pinchStartScale = cam.xScale
         case .changed, .ended:
-            setZoom(pinchStartScale * gr.scale, forceStreamRefresh: gr.state == .ended)
+            setZoom(pinchStartScale / max(gr.scale, 0.001), forceStreamRefresh: gr.state == .ended)
         default: break
         }
     }

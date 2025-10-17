@@ -312,8 +312,10 @@ final class CarNode: SKNode {
         tailL = SKShapeNode(rectOf: CGSize(width: 3.8, height: 2.0))
         tailL.fillColor = .red; tailL.strokeColor = .clear
         tailL.position = CGPoint(x: -W * 0.20, y: tailY - 0.5); tailL.zPosition = 4
-        tailR = (tailL.copy() as! SKShapeNode)
-        tailR.position = CGPoint(x:  W * 0.20, y: tailY - 0.5)
+        
+        tailR = SKShapeNode(rectOf: CGSize(width: 3.8, height: 2.0))
+        tailR.fillColor = .red; tailR.strokeColor = .clear
+        tailR.position = CGPoint(x:  W * 0.20, y: tailY - 0.5); tailR.zPosition = 4
         
         [headL, headR, tailL, tailR].forEach(addChild)
         
@@ -982,58 +984,58 @@ extension CarNode {
     
     func handleCrash(contact: SKPhysicsContact, other: SKPhysicsBody, damage: Int) {
         guard let pb = physicsBody, !isDead else { return }
-
-         // --- Always do a small bounce (walls, hills, obstacles, cars) ---
-         let hitPoint = contact.contactPoint
-
-         // outward-ish normal
-         var n = CGVector(dx: position.x - hitPoint.x, dy: position.y - hitPoint.y)
-         var len = hypot(n.dx, n.dy)
-         if len < 1e-5 {
-             // fallback: opposite relative velocity
-             let rel = CGVector(dx: pb.velocity.dx - other.velocity.dx,
-                                dy: pb.velocity.dy - other.velocity.dy)
-             n = CGVector(dx: -rel.dx, dy: -rel.dy)
-             len = max(1e-5, hypot(n.dx, n.dy))
-         }
-         n.dx /= len; n.dy /= len
-
-         // scale with approach speed a bit
-         let rel = CGVector(dx: pb.velocity.dx - other.velocity.dx,
-                            dy: pb.velocity.dy - other.velocity.dy)
-         let approach = max(0, -(rel.dx * n.dx + rel.dy * n.dy))
-         var j = 15 + 0.25 * approach                  // tune feel
-         j = CGFloat.clamp(j, 5, 20)
-         pb.applyImpulse(CGVector(dx: n.dx * j, dy: n.dy * j))
-
-         // trim inward component so we don't stick
-         var v = pb.velocity
-         let inward = -(v.dx * n.dx + v.dy * n.dy)
-         if inward > 0 {
-             v.dx += n.dx * inward
-             v.dy += n.dy * inward
-             pb.velocity = v
-         }
-
-         // --- Damage rules: walls & hills (and ramps) do NOT damage ---
-         let isWall = (other.categoryBitMask & Category.wall) != 0
-         let isRamp = (other.categoryBitMask & Category.ramp) != 0
-         let isHill = (other.node is HillNode)
-         let noDamage = isWall || isHill || isRamp
-         if noDamage { return }
-
-         // i-frames for damaging hits only
-         let now = CACurrentMediaTime()
-         let iFrame: TimeInterval = 0.12
-         if now - lastHitTime < iFrame { return }
-         lastHitTime = now
+        
+        // --- Always do a small bounce (walls, hills, obstacles, cars) ---
+        let hitPoint = contact.contactPoint
+        
+        // outward-ish normal
+        var n = CGVector(dx: position.x - hitPoint.x, dy: position.y - hitPoint.y)
+        var len = hypot(n.dx, n.dy)
+        if len < 1e-5 {
+            // fallback: opposite relative velocity
+            let rel = CGVector(dx: pb.velocity.dx - other.velocity.dx,
+                               dy: pb.velocity.dy - other.velocity.dy)
+            n = CGVector(dx: -rel.dx, dy: -rel.dy)
+            len = max(1e-5, hypot(n.dx, n.dy))
+        }
+        n.dx /= len; n.dy /= len
+        
+        // scale with approach speed a bit
+        let rel = CGVector(dx: pb.velocity.dx - other.velocity.dx,
+                           dy: pb.velocity.dy - other.velocity.dy)
+        let approach = max(0, -(rel.dx * n.dx + rel.dy * n.dy))
+        var j = 15 + 0.25 * approach                  // tune feel
+        j = CGFloat.clamp(j, 5, 20)
+        pb.applyImpulse(CGVector(dx: n.dx * j, dy: n.dy * j))
+        
+        // trim inward component so we don't stick
+        var v = pb.velocity
+        let inward = -(v.dx * n.dx + v.dy * n.dy)
+        if inward > 0 {
+            v.dx += n.dx * inward
+            v.dy += n.dy * inward
+            pb.velocity = v
+        }
+        
+        // --- Damage rules: walls & hills (and ramps) do NOT damage ---
+        let isWall = (other.categoryBitMask & Category.wall) != 0
+        let isRamp = (other.categoryBitMask & Category.ramp) != 0
+        let isHill = (other.node is HillNode)
+        let noDamage = isWall || isHill || isRamp
+        if noDamage { return }
+        
+        // i-frames for damaging hits only
+        let now = CACurrentMediaTime()
+        let iFrame: TimeInterval = 0.12
+        if now - lastHitTime < iFrame { return }
+        lastHitTime = now
         applyDamage(damage, hitWorldPoint: hitPoint)
     }
     
     func handleCrash(contact: SKPhysicsContact, other: SKPhysicsBody) {
         handleCrash(contact: contact, other: other, damage: 10)
     }
-
+    
     func playHitFX(at worldPoint: CGPoint?) {
         removeAction(forKey: "hitFX")
         let bumpUp = SKAction.scale(to: 1.08, duration: 0.08); bumpUp.timingMode = .easeOut
@@ -1244,7 +1246,7 @@ func tintCar(_ car: SKNode, to color: UIColor) {
            name.contains("heart") || name.contains("life") || name.contains("hud") {
             return
         }
-
+        
         if let sh = n as? SKShapeNode,
            sh.zPosition == 2,                 // your original “car body” filter
            sh.fillColor != .clear {
@@ -1257,53 +1259,61 @@ func tintCar(_ car: SKNode, to color: UIColor) {
 
 
 extension CarNode {
-    /// Simple kinematic controller
     func update(_ dt: CGFloat) {
         guard let pb = physicsBody, dt > 0 else { return }
+        
+        // --- before you change the velocity ---
+        let speed0 = hypot(pb.velocity.dx, pb.velocity.dy)
         
         // Heading (forward = +Y)
         let heading = zRotation + .pi/2
         let f = CGVector(dx: cos(heading), dy: sin(heading))
         let r = CGVector(dx: -f.dy, dy: f.dx)
         
-        var v = pb.velocity
+        let v = pb.velocity
         let fwd = v.dx * f.dx + v.dy * f.dy
         let lat = v.dx * r.dx + v.dy * r.dy
         
         // Control boost
-        let steerGain   = (controlBoostActive ? turnRate * 1.25 : turnRate)
-        let tractionK   = (controlBoostActive ? traction * 1.25 : traction)
+        let steerGain = (controlBoostActive ? turnRate * 1.25 : turnRate)
+        let tractionK = (controlBoostActive ? traction * 1.25 : traction)
         
         // Steering (body rotation locked)
         zRotation += steer * steerGain * dt
         
         // Caps
-        let capFwd   = (maxSpeed + speedCapBonus) * hillSpeedMul
-        let capRev   = -capFwd * reverseSpeedFactor
+        let capFwd = (maxSpeed + speedCapBonus) * hillSpeedMul
+        let capRev = -capFwd * reverseSpeedFactor
         
         // Throttle → forward accel
-        let accel    = acceleration * hillAccelMul
-        let df       = accel * throttle * dt
-        var newFwd   = CGFloat.clamp(fwd + df, capRev, capFwd)
+        let accel  = acceleration * hillAccelMul
+        let df     = accel * throttle * dt
+        var newFwd = CGFloat.clamp(fwd + df, capRev, capFwd)
         
         // Drag & lateral bleed
-        let keepLat  = CGFloat(exp(-Double(tractionK * dt)))
-        let newLat   = lat * keepLat
+        let keepLat = CGFloat(exp(-Double(tractionK * dt)))
+        let newLat  = lat * keepLat
         
         // Extra hill drag
-        let extraD   = max(0, 1 - hillDragK * dt * 0.002)
-        newFwd      *= extraD
+        let extraD  = max(0, 1 - hillDragK * dt * 0.002)
+        newFwd     *= extraD
         
-        v = CGVector(dx: f.dx * newFwd + r.dx * newLat,
-                     dy: f.dy * newFwd + r.dy * newLat)
-        pb.velocity = v
+        let vNew = CGVector(dx: f.dx * newFwd + r.dx * newLat,
+                            dy: f.dy * newFwd + r.dy * newLat)
+        pb.velocity = vNew
         
-        // Lights + exhaust
-        let speed = hypot(v.dx, v.dy)
-        updateExhaust(speed: speed, fwdMag: newFwd, dt: dt)
-        tailL.alpha = throttle < -0.2 ? 1.0 : 0.2
+        // --- brake light logic: speed drop (not signed forward change) ---
+        let speed1 = hypot(vNew.dx, vNew.dy)
+        let decel  = (speed0 - speed1) > 25 * dt       // tweak 25
+        let fast   = speed0 > 30                        // don’t light at crawl
+        let reverseCommand = (throttle < -0.1)          // will be false if you clamp to 0…1
+        let braking = reverseCommand || ((throttle <= 0.2) && decel && fast)
         
-        // Keep the mini HUD aligned each frame
+        tailL.alpha = braking || speed1 < 30 ? 1.0 : 0.2
+        tailR.alpha = tailL.alpha
+        
+        // Exhaust + miniHUD
+        updateExhaust(speed: speed1, fwdMag: newFwd, dt: dt)
         miniHUD.zRotation = -zRotation
     }
 }
