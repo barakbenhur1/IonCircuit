@@ -13,11 +13,10 @@ import ObjectiveC
 protocol CarNodeDelegate: AnyObject {
     func carNodeDidExplode(_ car: CarNode, at position: CGPoint)
     func carNodeRequestRespawnPoint(_ car: CarNode) -> CGPoint
-    // NEW: called when the car has no lives left
     func carNodeDidRunOutOfLives(_ car: CarNode)
 }
 
-// Optional HUD hooks; the scene may implement these.
+// Optional HUD hooks in the scene
 @objc protocol CarShieldReporting { @objc optional func onShieldChanged(_ value: Int) }
 @objc protocol CarWeaponReporting { @objc optional func onWeaponChanged(_ name: String) }
 @objc protocol CarStatusReporting {
@@ -25,26 +24,35 @@ protocol CarNodeDelegate: AnyObject {
     @objc optional func onMiniModeChanged(_ active: Bool)
 }
 
-// GameScene calls this on death to clear everything.
+// GameScene cleans these
 @objc protocol CarEnhancementResetting { func resetEnhancements() }
 
 private struct LivesCB { static var cb = 0 }
 
-// MARK: - CarNode
+// Store user callbacks (so we can wrap them to refresh mini HUD first)
+private struct HUDAssoc {
+    static var hpUserCB = 0
+    static var livesUserCB = 0
+}
+
 final class CarNode: SKNode {
     
     private enum Assoc {
         static var g: UInt8 = 0, z: UInt8 = 0, v: UInt8 = 0, a: UInt8 = 0
         static var m: UInt8 = 0, s: UInt8 = 0
         static var delegate = 0
+        static var shield: UInt8 = 0
+        static var wpn:    UInt8 = 0
+        static var ctrlOn: UInt8 = 0
+        static var miniOn: UInt8 = 0
     }
     
     // ---- Tuning ----
     var acceleration: CGFloat = 540.0
     var maxSpeed: CGFloat     = 1520.0
     var reverseSpeedFactor: CGFloat = 0.55
-    var turnRate: CGFloat     = 4.2          // used for control boost
-    var traction: CGFloat     = 12.0         // used for control boost
+    var turnRate: CGFloat     = 4.2
+    var traction: CGFloat     = 12.0
     var drag: CGFloat         = 1.0
     var brakeForce: CGFloat   = 1300.0
     var speedCapBonus: CGFloat = 0
@@ -62,7 +70,6 @@ final class CarNode: SKNode {
     // Exhaust VFX
     private var exhaustL: SKEmitterNode!
     private var exhaustR: SKEmitterNode!
-    
     private var exhaustMixLP: CGFloat = 0
     private let exhaustFadeTau: CGFloat = 0.35
     
@@ -77,9 +84,113 @@ final class CarNode: SKNode {
     private let airDragCoef: CGFloat = 1.8
     private let launchLossMax: CGFloat = 0.60
     
+    // Anyone else may read it later
+    var baseChassisPath: CGPath = CGMutablePath()
+    
+    // MARK: - Mini UI (attached to the car)
+    private let miniHUD = SKNode()
+    private let miniHPBack = SKShapeNode()
+    private let miniHPBar  = SKShapeNode()
+    private let miniShieldBar  = SKShapeNode()    // overlay (blue) above HP
+    private let miniLivesNode = SKNode()
+    private var heartNodes: [SKShapeNode] = []
+    
+    private struct MiniUI {
+        static let hpW: CGFloat = 60
+        static let hpH: CGFloat = 8
+        static let hpCorner: CGFloat = 4
+        static let overlayInset: CGFloat = 1      // shield overlay inset
+    }
+    
+    private func installMiniUIIfNeeded() {
+        guard miniHUD.parent == nil else { return }
+        // Keep the chip just above the car and centered
+        miniHUD.zPosition = 150
+        miniHUD.position = CGPoint(x: 0, y: 48)   // centered above car
+        addChild(miniHUD)
+        
+        // Background capsule
+        let backRect = CGRect(x: -MiniUI.hpW/2, y: 0, width: MiniUI.hpW, height: MiniUI.hpH)
+        miniHPBack.path = CGPath(roundedRect: backRect,
+                                 cornerWidth: MiniUI.hpCorner,
+                                 cornerHeight: MiniUI.hpCorner,
+                                 transform: nil)
+        miniHPBack.fillColor = UIColor(white: 0, alpha: 0.25)
+        miniHPBack.strokeColor = UIColor(white: 1, alpha: 0.16)
+        miniHPBack.lineWidth = 1
+        miniHUD.addChild(miniHPBack)
+        
+        // HP bar
+        miniHPBar.strokeColor = .clear
+        miniHUD.addChild(miniHPBar)
+        
+        // Shield overlay (sits ON the HP bar region)
+        miniShieldBar.strokeColor = .clear
+        miniShieldBar.zPosition = miniHPBar.zPosition + 1
+        miniShieldBar.alpha = 0.95
+        miniHUD.addChild(miniShieldBar)
+        
+        // Lives row above the bar
+        miniHUD.addChild(miniLivesNode)
+        miniLivesNode.position = CGPoint(x: 0, y: MiniUI.hpH + 8)
+        
+        refreshMiniHUD()
+    }
+    
+    private func layoutMiniHearts() {
+        // Build enough hearts
+        while heartNodes.count < maxLives {
+            let h = SKShapeNode(path: makeHeartPath(size: 7)) // bigger & clearer
+            h.fillColor = .systemRed
+            h.strokeColor = UIColor.black.withAlphaComponent(0.25)
+            h.lineWidth = 0.6
+            h.zPosition = 2
+            miniLivesNode.addChild(h)
+            heartNodes.append(h)
+        }
+        // Position & on/off by lives
+        let n = maxLives
+        let spacing: CGFloat = 12
+        let width = spacing * CGFloat(max(0, n - 1))
+        for (i, node) in heartNodes.enumerated() {
+            node.isHidden = i >= n
+            node.alpha = (i < livesLeft) ? 1.0 : 0.25
+            node.position = CGPoint(x: -width/2 + CGFloat(i) * spacing, y: 0)
+        }
+    }
+    
+    private func makeHeartPath(size r: CGFloat) -> CGPath {
+        // classic heart
+        let p = CGMutablePath()
+        p.move(to: CGPoint(x: 0, y: -r))
+        p.addCurve(to: CGPoint(x: -r, y: 0),
+                   control1: CGPoint(x: -0.6*r, y: -1.4*r),
+                   control2: CGPoint(x: -r,     y: -0.2*r))
+        p.addArc(center: CGPoint(x: -r/2, y: 0.2*r), radius: r/2,
+                 startAngle: .pi, endAngle: 0, clockwise: false)
+        p.addArc(center: CGPoint(x:  r/2, y: 0.2*r), radius: r/2,
+                 startAngle: .pi, endAngle: 0, clockwise: false)
+        p.addCurve(to: CGPoint(x: 0, y: -r),
+                   control1: CGPoint(x: r,     y: -0.2*r),
+                   control2: CGPoint(x: 0.6*r, y: -1.4*r))
+        p.closeSubpath()
+        return p
+    }
+    
+    // MARK: lives callback (wrap to also refresh mini HUD)
     var onLivesChanged: ((Int, Int) -> Void)? {
         get { objc_getAssociatedObject(self, &LivesCB.cb) as? (Int, Int) -> Void }
-        set { objc_setAssociatedObject(self, &LivesCB.cb, newValue, .OBJC_ASSOCIATION_COPY_NONATOMIC) }
+        set {
+            objc_setAssociatedObject(self, &HUDAssoc.livesUserCB, newValue, .OBJC_ASSOCIATION_COPY_NONATOMIC)
+            let wrapper: (Int, Int) -> Void = { [weak self] left, max in
+                guard let self else { return }
+                self.refreshMiniHUD()
+                if let user = objc_getAssociatedObject(self, &HUDAssoc.livesUserCB) as? (Int, Int) -> Void {
+                    user(left, max)
+                }
+            }
+            objc_setAssociatedObject(self, &LivesCB.cb, wrapper, .OBJC_ASSOCIATION_COPY_NONATOMIC)
+        }
     }
     
     // MARK: - Init
@@ -230,16 +341,75 @@ final class CarNode: SKNode {
         pb.contactTestBitMask = Category.hole | Category.obstacle | Category.ramp
         self.physicsBody = pb
         
-        // Forward points to +Y
         zRotation = 0
+        
+        // Mount the mini HUD chip
+        installMiniUIIfNeeded()
+        refreshMiniHUD()
     }
     
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    
+    // MARK: Mini HUD rendering
+    private func refreshMiniHP() {
+        // 0…1 HP fraction
+        let frac = max(0, min(1, CGFloat(hp) / CGFloat(maxHP)))
+        var w = MiniUI.hpW * frac
+        if w < 1 { w = 1 }
+        
+        let x0 = -MiniUI.hpW/2
+        let rect = CGRect(x: x0, y: 0, width: w, height: MiniUI.hpH)
+        let cw = min(MiniUI.hpCorner, rect.width * 0.5)
+        
+        let p = CGMutablePath()
+        p.addRoundedRect(in: rect, cornerWidth: cw, cornerHeight: cw)
+        miniHPBar.path = p
+        
+        let col: UIColor
+        switch frac {
+        case ..<0.25: col = .systemRed
+        case ..<0.55: col = .systemOrange
+        default:      col = .systemGreen
+        }
+        miniHPBar.fillColor = col.withAlphaComponent(0.95)
+    }
+    
+    private func refreshMiniShield() {
+        // Draw a blue overlay on top of HP bar region, width by 0…1 of shield
+        let sFrac = max(0, min(1, CGFloat(shield) / 100.0))
+        miniShieldBar.isHidden = sFrac <= 0
+        
+        guard sFrac > 0 else { return }
+        
+        let inset = MiniUI.overlayInset
+        let baseRect = CGRect(x: -MiniUI.hpW/2 + inset,
+                              y: inset,
+                              width: (MiniUI.hpW - inset*2) * sFrac,
+                              height: MiniUI.hpH - inset*2)
+        let cw = min(MiniUI.hpCorner - inset, baseRect.width * 0.5)
+        let p = CGMutablePath()
+        p.addRoundedRect(in: baseRect, cornerWidth: cw, cornerHeight: cw)
+        miniShieldBar.path = p
+        miniShieldBar.fillColor = UIColor.systemBlue.withAlphaComponent(0.80)
+        miniShieldBar.blendMode = .alpha
+    }
+}
+
+// Keep the chip synced & upright
+extension CarNode {
+    func refreshMiniHUD() {
+        miniHUD.isHidden = isHidden || isDead
+        refreshMiniHP()
+        refreshMiniShield()
+        layoutMiniHearts()
+        // Counter-rotate so the bar stays horizontal on screen
+        miniHUD.zRotation = -zRotation
+    }
 }
 
 // MARK: - Exhaust helpers
 extension CarNode {
-    private static func makeFlameTextureMedium() -> SKTexture {
+    static func makeFlameTextureMedium() -> SKTexture {
         let px: CGFloat = 30
         let size = CGSize(width: px, height: px)
         let img = UIGraphicsImageRenderer(size: size).image { ctx in
@@ -260,7 +430,7 @@ extension CarNode {
         return tex
     }
     
-    private static func makeExhaustEmitter(texture: SKTexture) -> SKEmitterNode {
+    static func makeExhaustEmitter(texture: SKTexture) -> SKEmitterNode {
         let e = SKEmitterNode()
         e.particleTexture = texture
         e.particleBirthRate = 0
@@ -288,7 +458,7 @@ extension CarNode {
         return e
     }
     
-    private func updateExhaust(speed: CGFloat, fwdMag: CGFloat, dt: CGFloat) {
+    func updateExhaust(speed: CGFloat, fwdMag: CGFloat, dt: CGFloat) {
         let moving = speed > 2.0 || throttle > 0.02
         let speedNorm = CGFloat.clamp(speed / max(maxSpeed, 1), 0, 1)
         let throttleBoost = max(0, throttle)
@@ -322,6 +492,125 @@ extension CarNode {
     }
 }
 
+// MARK: - Damage / enhancements plumbing used by GameScene
+extension CarNode {
+    
+    /// Applies incoming damage. Uses shield first, then HP, triggers FX & death.
+    func applyDamage(_ amount: Int, hitWorldPoint: CGPoint?) {
+        guard amount > 0, !isDead else { return }
+        
+        var remaining = amount
+        
+        // Shield absorbs first
+        if shield > 0 {
+            let absorbed = min(shield, remaining)
+            shield -= absorbed
+            remaining -= absorbed
+        }
+        
+        // HP next
+        if remaining > 0 {
+            hp = max(0, hp - remaining)
+            onHPChanged?(hp, maxHP)
+            refreshMiniHP()
+        }
+        
+        // Hit feedback
+        playHitFX(at: hitWorldPoint)
+        
+        // Death
+        if hp <= 0 { explode(at: hitWorldPoint ?? position) }
+    }
+}
+
+extension CarNode {
+    
+    /// Called by GameScene when a pickup is touched. Returns true if consumed.
+    @discardableResult
+    func applyEnhancement(_ kind: EnhancementKind) -> Bool {
+        switch kind {
+        case .hp20:
+            let before = hp
+            hp = min(maxHP, hp + 20)
+            if hp != before { onHPChanged?(hp, maxHP); refreshMiniHP() }
+            return hp > before
+            
+        case .shield20:
+            let before = shield
+            shield = min(100, shield + 20)   // refreshMiniShield is called by setter
+            return shield > before
+            
+        case .weaponRapid:  weaponMod = .rapid;  return true
+        case .weaponDamage: weaponMod = .damage; return true
+        case .weaponSpread: weaponMod = .spread; return true
+            
+        case .control:
+            if controlBoostActive { return false }
+            controlBoostActive = true
+            return true
+            
+        case .shrink:
+            if miniModeActive { return false }
+            miniModeActive = true
+            return true
+            
+        @unknown default:
+            return false
+        }
+    }
+}
+
+// MARK: - Enhancements state (shield / weapon / status flags)
+extension CarNode {
+    
+    enum WeaponMod: Int { case none = 0, rapid, damage, spread }
+    
+    var weaponMod: WeaponMod {
+        get { WeaponMod(rawValue: (objc_getAssociatedObject(self, &Assoc.wpn) as? Int) ?? 0) ?? .none }
+        set {
+            objc_setAssociatedObject(self, &Assoc.wpn, newValue.rawValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+            (scene as? CarWeaponReporting)?.onWeaponChanged?("\(newValue)")
+        }
+    }
+    
+    /// 0…100. Absorbs damage before HP.
+    var shield: Int {
+        get { (objc_getAssociatedObject(self, &Assoc.shield) as? Int) ?? 0 }
+        set {
+            let v = max(0, min(100, newValue))
+            objc_setAssociatedObject(self, &Assoc.shield, v, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+            refreshMiniShield()
+            (scene as? CarShieldReporting)?.onShieldChanged?(v)
+        }
+    }
+    
+    /// Permanent until reset (no TTL).
+    var controlBoostActive: Bool {
+        get { (objc_getAssociatedObject(self, &Assoc.ctrlOn) as? Bool) ?? false }
+        set {
+            objc_setAssociatedObject(self, &Assoc.ctrlOn, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+            (scene as? CarStatusReporting)?.onControlBoostChanged?(newValue)
+        }
+    }
+    
+    /// Permanent until reset. Visual scale for feedback only.
+    var miniModeActive: Bool {
+        get { (objc_getAssociatedObject(self, &Assoc.miniOn) as? Bool) ?? false }
+        set {
+            let old = miniModeActive
+            objc_setAssociatedObject(self, &Assoc.miniOn, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+            (scene as? CarStatusReporting)?.onMiniModeChanged?(newValue)
+            if old != newValue {
+                removeAction(forKey: "cn.mini.scale")
+                let target: CGFloat = newValue ? 0.9 : 1.0
+                let act = SKAction.scale(to: target, duration: 0.18)
+                act.timingMode = .easeOut
+                run(act, withKey: "cn.mini.scale")
+            }
+        }
+    }
+}
+
 // MARK: - Air / Verticality
 extension CarNode {
     private struct LandAssoc { static var t = 0 }
@@ -340,7 +629,7 @@ extension CarNode {
             onLivesChanged?(livesLeft, v)
         }
     }
-
+    
     var livesLeft: Int {
         get { (objc_getAssociatedObject(self, &LifeAssoc.left) as? Int) ?? 3 }
         set {
@@ -349,15 +638,16 @@ extension CarNode {
             onLivesChanged?(v, maxLives)
         }
     }
-
+    
     func resetLives(_ to: Int? = nil) {
         maxLives = to ?? maxLives
         livesLeft = maxLives
         onLivesChanged?(livesLeft, maxLives)
     }
     
-    private struct GhostAssoc { static var g = 0 }
-    private var _airGhosting: Bool {
+    struct GhostAssoc { static var g = 0 }
+    
+    var _airGhosting: Bool {
         get { (objc_getAssociatedObject(self, &GhostAssoc.g) as? Bool) ?? false }
         set { objc_setAssociatedObject(self, &GhostAssoc.g, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
     }
@@ -379,16 +669,17 @@ extension CarNode {
         set { objc_setAssociatedObject(self, &Assoc.a, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
     }
     
-    private var _groundMask: UInt32 {
+    var _groundMask: UInt32 {
         get { objc_getAssociatedObject(self, &Assoc.m) as? UInt32 ?? (physicsBody?.collisionBitMask ?? 0) }
         set { objc_setAssociatedObject(self, &Assoc.m, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
     }
-    private var shadowNode: SKShapeNode? {
+    
+    var shadowNode: SKShapeNode? {
         get { objc_getAssociatedObject(self, &Assoc.s) as? SKShapeNode }
         set { objc_setAssociatedObject(self, &Assoc.s, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
     }
     
-    /// Call once after the car is created (e.g. in GameScene.didMove)
+    /// Call once after creation
     func enableAirPhysics() {
         _groundMask = physicsBody?.collisionBitMask ?? 0
         let sh = SKShapeNode(ellipseOf: CGSize(width: 44, height: 18))
@@ -505,8 +796,7 @@ extension CarNode {
 
 // MARK: - Shooting (uses BulletNode.ShotStyle API)
 extension CarNode {
-    // Tuning
-    private var bulletSpeed: CGFloat { 1200 }   // world units / s
+    private var bulletSpeed: CGFloat { 1200 }
     private var singleTapCooldown: TimeInterval {
         switch weaponMod { case .rapid: return 0.12; default: return 0.22 }
     }
@@ -518,7 +808,6 @@ extension CarNode {
     }
     private var muzzleOffset: CGFloat { 26 }
     
-    // Keys & state
     private var fireArmKey:  String { "car.fire.arm" }
     private var fireLoopKey: String { "car.fire.loop" }
     private struct FireAssoc { static var last: UInt8 = 0 }
@@ -545,30 +834,26 @@ extension CarNode {
         let now = CACurrentMediaTime()
         if now - _lastShot < singleTapCooldown { return }
         _lastShot = now
-
+        
         guard let pb = physicsBody else { return }
         let style = currentShotStyle()
         let heading = zRotation + .pi/2
-
+        
         func spawn(angle: CGFloat) {
-            // 1) get a proper muzzle point in WORLD space
             let muzzleWorld = convert(CGPoint(x: 0, y: muzzleOffset), to: scene)
             let dir = CGVector(dx: cos(angle), dy: sin(angle))
-
-            // 2) create bullet centered at .zero (BulletNode below)
             let b = BulletNode(style: style, damage: currentBulletDamage)
             b.zRotation = angle
-            b.position  = muzzleWorld              // centered spawn point
+            b.position  = muzzleWorld
             scene.addChild(b)
-
-            // 3) give it velocity, inheriting the car's velocity
+            
             let vCar = pb.velocity
             b.physicsBody?.velocity = CGVector(
                 dx: vCar.dx + dir.dx * bulletSpeed,
                 dy: vCar.dy + dir.dy * bulletSpeed
             )
         }
-
+        
         if weaponMod == .spread {
             let off: CGFloat = .pi/26
             spawn(angle: heading)
@@ -577,7 +862,7 @@ extension CarNode {
         } else {
             spawn(angle: heading)
         }
-
+        
         muzzleFlash()
     }
     
@@ -659,7 +944,17 @@ extension CarNode {
     /// Called whenever HP changes: (hp, maxHP)
     var onHPChanged: ((Int, Int) -> Void)? {
         get { objc_getAssociatedObject(self, &Holder.cbKey) as? (Int, Int) -> Void }
-        set { objc_setAssociatedObject(self, &Holder.cbKey, newValue, .OBJC_ASSOCIATION_COPY_NONATOMIC) }
+        set {
+            objc_setAssociatedObject(self, &HUDAssoc.hpUserCB, newValue, .OBJC_ASSOCIATION_COPY_NONATOMIC)
+            let wrapper: (Int, Int) -> Void = { [weak self] hp, maxHP in
+                guard let self else { return }
+                self.refreshMiniHUD()
+                if let user = objc_getAssociatedObject(self, &HUDAssoc.hpUserCB) as? (Int, Int) -> Void {
+                    user(hp, maxHP)
+                }
+            }
+            objc_setAssociatedObject(self, &Holder.cbKey, wrapper, .OBJC_ASSOCIATION_COPY_NONATOMIC)
+        }
     }
     
     func resetHP() {
@@ -688,7 +983,7 @@ extension CarNode {
         applyDamage(10, hitWorldPoint: hitPoint)
     }
     
-    private func playHitFX(at worldPoint: CGPoint?) {
+    func playHitFX(at worldPoint: CGPoint?) {
         removeAction(forKey: "hitFX")
         let bumpUp = SKAction.scale(to: 1.08, duration: 0.08); bumpUp.timingMode = .easeOut
         let bumpDn = SKAction.scale(to: 1.0,  duration: 0.12); bumpDn.timingMode = .easeIn
@@ -712,10 +1007,10 @@ extension CarNode {
         (scene as? GameScene)?.shakeCamera(intensity: 5, duration: 0.12)
     }
     
-    private func explode(at worldPoint: CGPoint) {
+    func explode(at worldPoint: CGPoint) {
         guard !isDead else { return }
         isDead = true
-
+        
         // Freeze collisions
         if let pb = physicsBody {
             pb.velocity = .zero
@@ -724,25 +1019,22 @@ extension CarNode {
             pb.collisionBitMask = 0
             pb.contactTestBitMask = 0
         }
-
-        // Tell scene (shake/FX + camera freeze already happen there)
+        
         delegate?.carNodeDidExplode(self, at: worldPoint)
-
+        
         // Consume a life
         livesLeft = max(0, livesLeft - 1)
-
-        // Hide the car sprite while “dead”
+        
+        // Hide while “dead”
         isHidden = true
-
-        // Out of lives → stop here and let the scene show Game Over
+        miniHUD.isHidden = true
+        
         if livesLeft == 0 {
-            // Tell the scene so it can show the overlay
             delegate?.carNodeDidRunOutOfLives(self)
-            // Don’t auto-respawn — scene will call restartAfterGameOver(...)
             return
         }
-
-        // Still have lives → auto-respawn after a short delay
+        
+        // Auto-respawn
         run(.sequence([
             .wait(forDuration: 1.0),
             .run { [weak self] in
@@ -751,31 +1043,31 @@ extension CarNode {
                 self.position = spawn
                 self.zRotation = 0
                 self.physicsBody?.velocity = .zero
-
+                
                 if let pb = self.physicsBody {
                     pb.categoryBitMask = Category.car
                     pb.collisionBitMask = Category.wall | Category.obstacle
                     pb.contactTestBitMask = Category.hole | Category.obstacle | Category.ramp
                     self.enableCrashContacts()
                 }
-
+                
                 self.resetHP()
                 self.resetEnhancements()
                 self.isHidden = false
                 self.isDead = false
+                self.refreshMiniHUD()
+                self.miniHUD.isHidden = false
             }
         ]))
     }
     
     func restartAfterGameOver(at spawn: CGPoint) {
-        // reset counters/state
-        resetLives()         // back to maxLives (default 3)
+        resetLives()
         resetHP()
         resetEnhancements()
         isDead = false
         isHidden = false
-
-        // restore physics masks
+        
         if let pb = physicsBody {
             pb.velocity = .zero
             pb.angularVelocity = 0
@@ -784,478 +1076,174 @@ extension CarNode {
             pb.contactTestBitMask = Category.hole | Category.obstacle | Category.ramp
             enableCrashContacts()
         }
-
+        
         position = spawn
         zRotation = 0
         
         onHPChanged?(hp, maxHP)
+        refreshMiniHUD()
+        miniHUD.isHidden = false
     }
 }
 
 // MARK: - Hills (per-frame multipliers used by GameScene)
 extension CarNode {
     private struct HillAssoc { static var spd = 0, acc = 0, drg = 0 }
-    /// Multiply forward/reverse speed cap while on hills (0…1, default 1).
     var hillSpeedMul: CGFloat {
         get { objc_getAssociatedObject(self, &HillAssoc.spd) as? CGFloat ?? 1 }
         set { objc_setAssociatedObject(self, &HillAssoc.spd, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
     }
-    /// Multiply acceleration while on hills (0…1, default 1).
     var hillAccelMul: CGFloat {
         get { objc_getAssociatedObject(self, &HillAssoc.acc) as? CGFloat ?? 1 }
         set { objc_setAssociatedObject(self, &HillAssoc.acc, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
     }
-    /// Extra per-second horizontal drag applied on hills (0 = none).
     var hillDragK: CGFloat {
         get { objc_getAssociatedObject(self, &HillAssoc.drg) as? CGFloat ?? 0 }
         set { objc_setAssociatedObject(self, &HillAssoc.drg, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
     }
 }
 
-// MARK: - Simple HUD
-final class CarHealthHUDNode: SKNode {
+// MARK: - Role & Simple AI
+extension CarNode {
     
-    private let livesRow = SKNode()
-    private var heartNodes: [SKLabelNode] = []
-
-    // public API ---------------------------------------------------------------
-    func set(hp: Int, maxHP: Int, shield: Int) {
-        let hpC = max(0, min(hp, maxHP))
-        let shC = max(0, min(shield, 100)) // cap 100
-
-        // numbers
-        hpValueLabel.text = "\(hpC)/\(maxHP)"
-        if shC > 0 {
-            shieldChip.isHidden = false
-            shieldValueLabel.text = "\(shC)"
-        } else {
-            shieldChip.isHidden = true
-        }
-
-        // bars
-        let fracHP = CGFloat(hpC) / max(1, CGFloat(maxHP))
-        let fracSH = CGFloat(shC) / 100.0
-
-        let hpW = barWidth * fracHP
-        hpBar.path = CGPath(roundedRect: CGRect(x: -barWidth/2, y: -barH/2, width: hpW, height: barH),
-                            cornerWidth: barH/2, cornerHeight: barH/2, transform: nil)
-
-        let shW = barWidth * fracSH
-        shieldOverlay.path = CGPath(roundedRect: CGRect(x: -barWidth/2, y: -barH/2, width: shW, height: barH),
-                                    cornerWidth: barH/2, cornerHeight: barH/2, transform: nil)
-    }
-
-    func place(at worldPos: CGPoint) { position = worldPos }
-
-    // internals ----------------------------------------------------------------
-    private let card     = SKShapeNode()
-    private let hpTitle  = SKLabelNode(fontNamed: "Menlo-Bold")
-    private let hpValueLabel = SKLabelNode(fontNamed: "Menlo")
-    private let shieldChip = SKShapeNode()
-    private let shieldLabel = SKLabelNode(fontNamed: "Menlo-Bold")
-    private let shieldValueLabel = SKLabelNode(fontNamed: "Menlo")
-
-    private let barBase = SKShapeNode()
-    private let hpBar   = SKShapeNode()
-    private let shieldOverlay = SKShapeNode()
-
-    private let barWidth: CGFloat = 160
-    private let barH: CGFloat = 12
-
-    override init() {
-        super.init()
-        zPosition = 700
-
-        let w: CGFloat = 180, h: CGFloat = 44
-        card.path = CGPath(roundedRect: CGRect(x: -w/2, y: -h/2 - 15, width: w, height: h),
-                           cornerWidth: 14, cornerHeight: 14, transform: nil)
-        card.fillColor   = UIColor(white: 0, alpha: 0.28)
-        card.strokeColor = UIColor(white: 1, alpha: 0.10)
-        card.lineWidth   = 1
-        addChild(card)
-
-        hpTitle.text = "HP"
-        hpTitle.fontSize = 13
-        hpTitle.fontColor = UIColor.white.withAlphaComponent(0.9)
-        hpTitle.horizontalAlignmentMode = .left
-        hpTitle.verticalAlignmentMode = .center
-        hpTitle.position = CGPoint(x: -w/2 + 44, y: h/2 - 35.5)
-        addChild(hpTitle)
-
-        hpValueLabel.text = "0/0"
-        hpValueLabel.fontSize = 13
-        hpValueLabel.fontColor = UIColor.white.withAlphaComponent(0.9)
-        hpValueLabel.horizontalAlignmentMode = .left
-        hpValueLabel.verticalAlignmentMode = .center
-        hpValueLabel.position = CGPoint(x: -w/2 + 64, y: h/2 - 36)
-        addChild(hpValueLabel)
-
-        let chipH: CGFloat = 18
-        let chipW: CGFloat = 90
-        shieldChip.path = CGPath(roundedRect: CGRect(x: -chipW/2, y: -chipH/2, width: chipW, height: chipH),
-                                 cornerWidth: chipH/2, cornerHeight: chipH/2, transform: nil)
-        shieldChip.fillColor   = UIColor.systemBlue.withAlphaComponent(0.25)
-        shieldChip.strokeColor = UIColor.systemBlue.withAlphaComponent(0.8)
-        shieldChip.lineWidth   = 1
-        shieldChip.position = CGPoint(x: -w/2 + 160, y: h/2 - 15)
-        addChild(shieldChip)
-
-        shieldLabel.text = "Shield"
-        shieldLabel.fontSize = 12
-        shieldLabel.fontColor = UIColor.white
-        shieldLabel.verticalAlignmentMode = .center
-        shieldLabel.horizontalAlignmentMode = .center
-        shieldLabel.position = CGPoint(x: -18, y: 0)
-        shieldChip.addChild(shieldLabel)
-
-        shieldValueLabel.text = "0"
-        shieldValueLabel.fontSize = 12
-        shieldValueLabel.fontColor = UIColor.white
-        shieldValueLabel.verticalAlignmentMode = .center
-        shieldValueLabel.horizontalAlignmentMode = .center
-        shieldValueLabel.position = CGPoint(x: 26, y: 0)
-        shieldChip.addChild(shieldValueLabel)
-
-        barBase.path = CGPath(roundedRect: CGRect(x: -barWidth/2, y: -barH/2, width: barWidth, height: barH),
-                              cornerWidth: barH/2, cornerHeight: barH/2, transform: nil)
-        barBase.fillColor = UIColor.white.withAlphaComponent(0.10)
-        barBase.strokeColor = UIColor.white.withAlphaComponent(0.08)
-        barBase.lineWidth = 1
-        barBase.position = CGPoint(x: 0, y: -14)
-        addChild(barBase)
-
-        hpBar.fillColor = UIColor.systemGreen.withAlphaComponent(0.9)
-        hpBar.strokeColor = .clear
-        hpBar.position = barBase.position
-        addChild(hpBar)
-
-        shieldOverlay.fillColor = UIColor.systemBlue.withAlphaComponent(0.85)
-        shieldOverlay.strokeColor = .clear
-        shieldOverlay.position = barBase.position
-        shieldOverlay.zPosition = 1
-        addChild(shieldOverlay)
-        
-        livesRow.position = CGPoint(x: 0, y: 14) // above the bar
-        addChild(livesRow)
-        setLives(left: 3, max: 3)
-
-        shieldChip.isHidden = true
-        set(hp: 0, maxHP: 100, shield: 0)
-    }
-
-    required init?(coder: NSCoder) { fatalError() }
+    enum Kind: Int { case player = 0, enemy = 1 }
     
-    func setLives(left: Int, max: Int) {
-        rebuildLives(left: left, max: max)
+    private struct RoleAssoc { static var k = 0, tgt = 0, wander = 0 }
+    
+    var kind: Kind {
+        get { Kind(rawValue: (objc_getAssociatedObject(self, &RoleAssoc.k) as? Int) ?? 0) ?? .player }
+        set { objc_setAssociatedObject(self, &RoleAssoc.k, newValue.rawValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
     }
-
-    private func rebuildLives(left: Int, max: Int) {
-        livesRow.removeAllChildren()
-        heartNodes.removeAll()
-        
-        // layout
-        let spacing: CGFloat = 16
-        let totalW = spacing * CGFloat(max - 1)
-        let startX = -totalW / 2.0
-        
-        for i in 0..<max {
-            let lbl = SKLabelNode(fontNamed: "Menlo-Bold")
-            lbl.fontSize = 14
-            lbl.verticalAlignmentMode = .center
-            lbl.horizontalAlignmentMode = .center
-            let filled = i < left
-            lbl.text = filled ? "♥︎" : "♡"
-            lbl.fontColor = filled ? UIColor.systemRed : UIColor.white.withAlphaComponent(0.6)
-            lbl.position = CGPoint(x: startX + CGFloat(i) * spacing, y: 0)
-            livesRow.addChild(lbl)
-            heartNodes.append(lbl)
-        }
+    
+    weak var aiTarget: CarNode? {
+        get { objc_getAssociatedObject(self, &RoleAssoc.tgt) as? CarNode }
+        set { objc_setAssociatedObject(self, &RoleAssoc.tgt, newValue, .OBJC_ASSOCIATION_ASSIGN) }
+    }
+    
+    private var _wander: CGFloat {
+        get { (objc_getAssociatedObject(self, &RoleAssoc.wander) as? CGFloat) ?? 0 }
+        set { objc_setAssociatedObject(self, &RoleAssoc.wander, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
+    }
+    
+    func configure(kind: Kind, target: CarNode? = nil) {
+        self.kind = kind
+        self.aiTarget = target
+        if kind == .enemy { enableCrashContacts() }
+        // scale chip a bit smaller on enemies
+        miniHUD.setScale(kind == .player ? 0.85 : 0.65)
+    }
+    
+    @inline(__always) private func clamp(_ v: CGFloat, _ a: CGFloat, _ b: CGFloat) -> CGFloat {
+        return max(a, min(b, v))
+    }
+    
+    @inline(__always) private func shortestAngle(from: CGFloat, to: CGFloat) -> CGFloat {
+        var d = to - from
+        while d > .pi { d -= (.pi * 2) }
+        while d < -.pi { d += (.pi * 2) }
+        return d
+    }
+    
+    func runEnemyAI(_ dt: CGFloat) {
+        if isDead { throttle = 0; steer = 0.001; return }
+        guard physicsBody != nil else { return }
+        // (basic AI intentionally left commented out for now)
     }
 }
 
-// MARK: - Enhancements (real gameplay effects, persistent)
-private final class CGPathBox: NSObject { let value: CGPath; init(_ v: CGPath) { value = v } }
-
-extension CarNode {
-    
-    // Store the original chassis for physics rebuilds after Mini Mode.
-    private struct EnhAssoc {
-        static var basePath = 0
-        static var shield = 0
-        static var weapon = 0
-        static var control = 0
-        static var mini = 0
-        static var baseTurn = 0
-        static var baseTraction = 0
+// HSB utilities + visual distance
+extension UIColor {
+    func hsb() -> (h: CGFloat, s: CGFloat, b: CGFloat) {
+        var h: CGFloat = 0, s: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        guard getHue(&h, saturation: &s, brightness: &b, alpha: &a) else { return (0,0,0) }
+        return (h,s,b)
     }
-    
-    // Keep the raw path boxed to avoid CF bridging warnings.
-    var baseChassisPath: CGPath? {
-        get { (objc_getAssociatedObject(self, &EnhAssoc.basePath) as? CGPathBox)?.value }
-        set {
-            if let p = newValue {
-                objc_setAssociatedObject(self, &EnhAssoc.basePath, CGPathBox(p), .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
-            } else {
-                objc_setAssociatedObject(self, &EnhAssoc.basePath, nil, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
-            }
-        }
-    }
-    
-    // MARK: Shield (0…100). Absorbs damage before HP.
-    var shield: Int {
-        get { (objc_getAssociatedObject(self, &EnhAssoc.shield) as? Int) ?? 0 }
-        set {
-            let clamped = max(0, min(100, newValue))
-            objc_setAssociatedObject(self, &EnhAssoc.shield, clamped, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
-            (scene as? CarShieldReporting)?.onShieldChanged?(clamped)
-        }
-    }
-    
-    // MARK: Weapon mod (one at a time)
-    enum WeaponMod: Int { case none = 0, rapid, damage, spread
-        var display: String {
-            switch self {
-            case .none: return "None"
-            case .rapid: return "Rapid Fire"
-            case .damage: return "Damage Boost"
-            case .spread: return "Spread Shot"
-            }
-        }
-    }
-    var weaponMod: WeaponMod {
-        get { WeaponMod(rawValue: (objc_getAssociatedObject(self, &EnhAssoc.weapon) as? Int) ?? 0) ?? .none }
-        set {
-            objc_setAssociatedObject(self, &EnhAssoc.weapon, newValue.rawValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
-            (scene as? CarWeaponReporting)?.onWeaponChanged?(newValue.display)
-        }
-    }
-    
-    // MARK: Control boost (persistent; non-stacking)
-    var controlBoostActive: Bool {
-        get { (objc_getAssociatedObject(self, &EnhAssoc.control) as? Bool) ?? false }
-        set {
-            let was = controlBoostActive
-            objc_setAssociatedObject(self, &EnhAssoc.control, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
-            if newValue == was { return }
-            if objc_getAssociatedObject(self, &EnhAssoc.baseTurn) == nil {
-                objc_setAssociatedObject(self, &EnhAssoc.baseTurn, self.turnRate, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
-            }
-            if objc_getAssociatedObject(self, &EnhAssoc.baseTraction) == nil {
-                objc_setAssociatedObject(self, &EnhAssoc.baseTraction, self.traction, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
-            }
-            if newValue {
-                self.turnRate = (objc_getAssociatedObject(self, &EnhAssoc.baseTurn) as? CGFloat ?? self.turnRate) * 1.22
-                self.traction = (objc_getAssociatedObject(self, &EnhAssoc.baseTraction) as? CGFloat ?? self.traction) * 1.18
-            } else {
-                if let base = objc_getAssociatedObject(self, &EnhAssoc.baseTurn) as? CGFloat { self.turnRate = base }
-                if let base = objc_getAssociatedObject(self, &EnhAssoc.baseTraction) as? CGFloat { self.traction = base }
-            }
-            (scene as? CarStatusReporting)?.onControlBoostChanged?(newValue)
-        }
-    }
-    
-    // MARK: Mini Mode (persistent; non-stacking)
-    var miniModeActive: Bool {
-        get { (objc_getAssociatedObject(self, &EnhAssoc.mini) as? Bool) ?? false }
-        set {
-            let was = miniModeActive
-            objc_setAssociatedObject(self, &EnhAssoc.mini, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
-            if newValue == was { return }
-            
-            let targetScale: CGFloat = newValue ? 0.94 : 1.0
-            let act = SKAction.group([
-                .scaleX(to: targetScale, duration: 0.32),
-                .scaleY(to: targetScale, duration: 0.32)
-            ])
-            act.timingMode = .easeInEaseOut
-            run(act)
-            rebuildBody(scale: targetScale)
-            (scene as? CarStatusReporting)?.onMiniModeChanged?(newValue)
-        }
-    }
-    
-    private func rebuildBody(scale: CGFloat) {
-        guard let base = baseChassisPath, let old = physicsBody else { return }
-        var t = CGAffineTransform(scaleX: scale, y: scale)
-        let scaled = base.copy(using: &t) ?? base
-        
-        let saveCat = old.categoryBitMask
-        let saveCol = old.collisionBitMask
-        let saveCon = old.contactTestBitMask
-        let dyn = old.isDynamic
-        let precise = old.usesPreciseCollisionDetection
-        
-        let pb = SKPhysicsBody(polygonFrom: scaled)
-        pb.isDynamic = dyn
-        pb.allowsRotation = false
-        pb.friction = 0
-        pb.linearDamping = drag
-        pb.angularDamping = 2
-        pb.affectedByGravity = false
-        pb.usesPreciseCollisionDetection = precise
-        pb.categoryBitMask = saveCat
-        pb.collisionBitMask = saveCol
-        pb.contactTestBitMask = saveCon
-        self.physicsBody = pb
-        
-        _groundMask = pb.collisionBitMask
-    }
-    
-    // MARK: Enhancement application (GameScene calls this when picking up)
-    @discardableResult
-    func applyEnhancement(_ kind: EnhancementKind) -> Bool {
-        switch kind {
-        case .hp20:
-            if hp >= maxHP { return false }
-            hp = min(maxHP, hp + 20); onHPChanged?(hp, maxHP); return true
-            
-        case .shield20:
-            if shield >= 100 { return false }
-            shield = min(100, shield + 20); return true
-            
-        case .weaponRapid:   weaponMod = .rapid;  return true
-        case .weaponDamage:  weaponMod = .damage; return true
-        case .weaponSpread:  weaponMod = .spread; return true
-        case .control:       if controlBoostActive { return false }; controlBoostActive = true; return true
-        case .shrink:        if miniModeActive { return false }; miniModeActive = true; return true
-            
-        @unknown default: return false
-        }
-    }
-    
-    // Damage helpers routed through shield
-    func applyDamage(_ raw: Int, hitWorldPoint: CGPoint? = nil) {
-        var dmg = max(0, raw)
-        if shield > 0, dmg > 0 {
-            let used = min(shield, dmg)
-            shield -= used
-            dmg    -= used
-        }
-        if dmg > 0 { hp = max(0, hp - dmg) }
-        onHPChanged?(hp, maxHP)
-        playHitFX(at: hitWorldPoint)
-        if hp == 0 {
-            let world = hitWorldPoint
-            ?? (scene.flatMap { self.convert(.zero, to: $0) })
-            ?? .zero
-            explode(at: world)
-        }
-    }
-    
-    @objc func resetEnhancements() {
-        controlBoostActive = false
-        miniModeActive = false
-        weaponMod = .none
-        shield = 0
-    }
-    
-    @discardableResult
-    func applyIncomingCrashImpulse(_ impulse: CGFloat) -> Int {
-        let raw = max(0, impulse - 30) * 0.28
-        let dmg = Int(raw.rounded())
-        guard dmg > 0 else { return 0 }
-        return applyIncomingDamage(dmg)
-    }
-    
-    @discardableResult
-    func applyIncomingDamage(_ amount: Int) -> Int {
-        var remaining = max(0, amount)
-        if shield > 0 {
-            let absorbed = min(shield, remaining)
-            shield -= absorbed
-            remaining -= absorbed
-        }
-        if remaining > 0 {
-            let was = hp
-            hp = max(0, hp - remaining)
-            onHPChanged?(hp, maxHP)
-            return was - hp
-        }
-        return 0
+    func isVisuallyClose(to other: UIColor,
+                         hueThresh: CGFloat = 0.08,
+                         satThresh: CGFloat = 0.18,
+                         brightThresh: CGFloat = 0.22) -> Bool {
+        let a = self.hsb(), b = other.hsb()
+        let dhRaw = abs(a.h - b.h)
+        let dh = min(dhRaw, 1 - dhRaw)
+        return dh < hueThresh && abs(a.s - b.s) < satThresh && abs(a.b - b.b) < brightThresh
     }
 }
 
-// MARK: - Driving update
+// Random color distinct from `avoid`
+func randomDistinctColor(avoid: UIColor) -> UIColor {
+    let avoidHSB = avoid.hsb()
+    for _ in 0..<12 {
+        let h = CGFloat.random(in: 0..<1)
+        let s = CGFloat.random(in: 0.60...0.95)
+        let b = CGFloat.random(in: 0.70...0.98)
+        let candidate = UIColor(hue: h, saturation: s, brightness: b, alpha: 1)
+        if !candidate.isVisuallyClose(to: avoid) { return candidate }
+    }
+    let h2 = fmod(avoidHSB.h + 0.5, 1.0)
+    let s2 = max(avoidHSB.s, 0.75)
+    let b2 = max(avoidHSB.b, 0.85)
+    return UIColor(hue: h2, saturation: s2, brightness: b2, alpha: 1)
+}
+
+// Apply tint to all sprites under the car
+func tintCar(_ car: SKNode, to color: UIColor) {
+    func visit(_ n: SKNode) {
+        if let sh = n as? SKShapeNode, sh.zPosition == 2 {
+            sh.fillColor = color
+        }
+        for c in n.children { visit(c) }
+    }
+    visit(car)
+}
+
 extension CarNode {
+    /// Simple kinematic controller
     func update(_ dt: CGFloat) {
-        guard let pb = physicsBody else { return }
+        guard let pb = physicsBody, dt > 0 else { return }
+        
+        // Heading (forward = +Y)
         let heading = zRotation + .pi/2
-        let fwd     = CGVector(dx: cos(heading),  dy: sin(heading))
-        let right   = CGVector(dx: -sin(heading), dy: cos(heading))
+        let f = CGVector(dx: cos(heading), dy: sin(heading))
+        let r = CGVector(dx: -f.dy, dy: f.dx)
         
-        if isAirborne {
-            let retain = exp(-dt * 2.3)
-            var vv = pb.velocity
-            vv.dx *= retain; vv.dy *= retain
-            let airCap = (maxSpeed + max(0, speedCapBonus)) * 0.78
-            let sp = hypot(vv.dx, vv.dy)
-            if sp > airCap {
-                let k = airCap / max(sp, 0.001)
-                vv.dx *= k; vv.dy *= k
-            }
-            pb.velocity = vv
-            let yaw = steer.clamped(-1, 1) * (turnRate * 0.35)
-            zRotation += yaw * dt
-            pb.angularVelocity = 0
-            let fwdMag  = vv.dx * fwd.dx + vv.dy * fwd.dy
-            updateExhaust(speed: sp, fwdMag: fwdMag, dt: dt)
-            return
-        }
+        var v = pb.velocity
+        let fwd = v.dx * f.dx + v.dy * f.dy
+        let lat = v.dx * r.dx + v.dy * r.dy
         
-        var v      = pb.velocity
-        let fwdMag = v.dx * fwd.dx + v.dy * fwd.dy
-        let latMag = v.dx * right.dx + v.dy * right.dy
+        // Control boost
+        let steerGain   = (controlBoostActive ? turnRate * 1.25 : turnRate)
+        let tractionK   = (controlBoostActive ? traction * 1.25 : traction)
         
-        let latKill = 1 - exp(-dt * traction * 4.0)
-        v.dx -= right.dx * latMag * latKill
-        v.dy -= right.dy * latMag * latKill
+        // Steering (body rotation locked)
+        zRotation += steer * steerGain * dt
+        
+        // Caps
+        let capFwd   = (maxSpeed + speedCapBonus) * hillSpeedMul
+        let capRev   = -capFwd * reverseSpeedFactor
+        
+        // Throttle → forward accel
+        let accel    = acceleration * hillAccelMul
+        let df       = accel * throttle * dt
+        var newFwd   = CGFloat.clamp(fwd + df, capRev, capFwd)
+        
+        // Drag & lateral bleed
+        let keepLat  = CGFloat(exp(-Double(tractionK * dt)))
+        let newLat   = lat * keepLat
+        
+        // Extra hill drag
+        let extraD   = max(0, 1 - hillDragK * dt * 0.002)
+        newFwd      *= extraD
+        
+        v = CGVector(dx: f.dx * newFwd + r.dx * newLat,
+                     dy: f.dy * newFwd + r.dy * newLat)
         pb.velocity = v
         
-        if hillDragK > 0 {
-            let keep = exp(-dt * hillDragK)
-            var vv = pb.velocity
-            vv.dx *= keep; vv.dy *= keep
-            pb.velocity = vv
-        }
+        // Lights + exhaust
+        let speed = hypot(v.dx, v.dy)
+        updateExhaust(speed: speed, fwdMag: newFwd, dt: dt)
+        tailL.alpha = throttle < -0.2 ? 1.0 : 0.2
         
-        if abs(throttle) < 0.001 && abs(steer) < 0.001 {
-            let lin = exp(-dt * 14.0)
-            var vv = pb.velocity
-            vv.dx *= lin; vv.dy *= lin
-            if hypot(vv.dx, vv.dy) < 1.0 { vv = .zero }
-            pb.velocity = vv
-            pb.angularVelocity = 0
-            updateExhaust(speed: 0, fwdMag: 0, dt: dt)
-            return
-        }
-        
-        // drive
-        let input = throttle.clamped(-1, 1)
-        let opposes = (input > 0 && fwdMag < 0) || (input < 0 && fwdMag > 0)
-        if opposes {
-            let sign: CGFloat = fwdMag >= 0 ? 1 : -1
-            pb.applyForce(fwd.scaled(-sign * brakeForce))
-        } else {
-            pb.applyForce(fwd.scaled(input * acceleration * max(0, hillAccelMul)))
-        }
-        
-        let capForwardBase = maxSpeed + max(0, speedCapBonus)
-        let capForward     = capForwardBase * max(0.1, hillSpeedMul)
-        let cap = (fwdMag >= 0 ? capForward : maxSpeed * reverseSpeedFactor)
-        let speed = hypot(pb.velocity.dx, pb.velocity.dy)
-        if speed > cap {
-            let s = cap / max(speed, 0.001)
-            pb.velocity = CGVector(dx: pb.velocity.dx * s, dy: pb.velocity.dy * s)
-        }
-        
-        let speedScale = 0.50 + 0.50 * CGFloat.clamp(abs(fwdMag) / 240.0, 0, 1)
-        let slowAssist = 1.0 + CGFloat.clamp(80 - abs(fwdMag), 0, 80) / 90.0
-        let commandedYaw = steer.clamped(-1, 1) * turnRate * speedScale * slowAssist
-        let maxYaw: CGFloat = 4.0
-        let yaw = CGFloat.clamp(commandedYaw, -maxYaw, maxYaw)
-        zRotation += yaw * dt
-        pb.angularVelocity = 0
-        
-        updateExhaust(speed: hypot(pb.velocity.dx, pb.velocity.dy), fwdMag: fwdMag, dt: dt)
+        // Keep the mini HUD aligned each frame
+        miniHUD.zRotation = -zRotation
     }
 }

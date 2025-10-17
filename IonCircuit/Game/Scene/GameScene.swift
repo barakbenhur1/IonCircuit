@@ -161,6 +161,11 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     private let enhancementHUD = EnhancementHUDNode()
     private let gameOverOverlay = GameOverOverlayNode()
     
+    private var minZoom: CGFloat = 1.0   // max zoom OUT (see more map)
+    private var maxZoom: CGFloat = 2.4   // max zoom IN
+    private var pinchGR: UIPinchGestureRecognizer?
+    private var pinchStartScale: CGFloat = 1.0
+    
     // ==== Controls / Handedness ====
     private var isLeftHanded = true
     private var controlsLockedForOverlay = false
@@ -171,6 +176,8 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     private var pausedForDeath = false            // NEW
     
     private let strictCentering = true
+    
+    private var cars: [CarNode] = []   // includes the player car
     
     private func pauseWorldForDeath() {           // NEW
         guard !pausedForDeath else { return }
@@ -191,9 +198,6 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         // pause node trees that animate
         openWorld?.isPaused = true
         obstacleRoot.isPaused = true
-        
-        // IMPORTANT FIX: do NOT pause the car or its actions won't run (respawn never triggers)
-        // car.isPaused = true   // ← removed
         
         // optional: quiet HUD motion
         speedHUD.isPaused = true
@@ -220,11 +224,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     // MARK: Enhancements reset (on death)
     private func resetEnhancementsOnDeath() {
         // Car: call strongly if it conforms, else fall back to Obj-C selector safely.
-        if let resettable = car as? CarEnhancementResetting {
-            resettable.resetEnhancements()
-        } else if (car as NSObject).responds(to: #selector(CarEnhancementResetting.resetEnhancements)) {
-            (car as NSObject).perform(#selector(CarEnhancementResetting.resetEnhancements))
-        }
+        car.resetEnhancements()
         
         // HUD: find it, then either use the protocol or a selector fallback.
         if let hud = camera?.children.first(where: { $0 is EnhancementHUDNode }) {
@@ -242,6 +242,50 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         }
         
         //        enhancementHUD.flashToast("Enhancements reset", tint: .systemTeal)
+    }
+    
+    private func detectCarColor(of car: SKNode) -> UIColor {
+        // Prefer the body chassis (zPosition == 2)
+        var result: UIColor?
+        func visit(_ n: SKNode) {
+            if let sh = n as? SKShapeNode, sh.zPosition == 2, result == nil {
+                result = sh.fillColor
+            }
+            for c in n.children where result == nil { visit(c) }
+        }
+        visit(car)
+        return result ?? .systemRed
+    }
+    
+    private func setZoom(_ z: CGFloat, forceStreamRefresh: Bool = false) {
+        let s = clamp(z, minZoom, maxZoom)
+        camera?.setScale(s)
+        if forceStreamRefresh { refreshObstacleStreaming(force: true) }
+    }
+    
+    func spawnEnemy(at p: CGPoint) -> CarNode {
+        let enemy = spawnCar(kind: .enemy, at: p, target: car)
+        
+        let playerColor = detectCarColor(of: car)
+        let color = randomDistinctColor(avoid: playerColor)
+        tintCar(enemy, to: color)
+        
+        return enemy
+    }
+    
+    @discardableResult
+    func spawnCar(kind: CarNode.Kind,
+                  at position: CGPoint? = nil,
+                  target: CarNode? = nil) -> CarNode {
+        let c = CarNode()
+        c.position = position ?? safeSpawnPoint(in: cameraWorldRect(margin: 400).insetBy(dx: 120, dy: 120),
+                                                radius: spawnClearance)
+        c.delegate = self
+        c.configure(kind: kind, target: target)
+        c.enableCrashContacts()
+        addChild(c)
+        cars.append(c)
+        return c
     }
     
     // MARK: - Scene lifecycle
@@ -269,6 +313,9 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         car.enableAirPhysics()
         car.delegate = self
         
+        car.configure(kind: .player)
+        
+        cars = [car]
         
         let n = EnhancementNode(kind: .shield20)
         n.position = safeSpawnPoint(in: searchRect.insetBy(dx: 40, dy: 300), radius: spawnClearance)
@@ -285,6 +332,11 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         camera = cam
         addChild(cam)
         cam.position = car.position
+        
+        // ⬇️ Start at MAX ZOOM OUT and enable pinch zoom
+        setZoom(minZoom) // start zoomed all the way out
+        pinchGR = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
+        view.addGestureRecognizer(pinchGR!)
         
         buildRampPointerIfNeeded()
         
@@ -316,25 +368,28 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         cam.addChild(driveButton)
         placeDriveButton()
         
-        placeHUD()
-        
         // Health HUD
         camera?.addChild(healthHUD)
         placeHUD()
         
-        // Car damage notifications → HUD
-        car.maxHP = 100
-        
         // When HP changes (including after shield-only hits, because we call onHPChanged above)
-        car.onHPChanged = { [weak self] _, _ in self?.updateHealthHUD() }
-        car.onHPChanged?(car.hp, car.maxHP)   // initial draw
-        car.enableCrashContacts()
-        
-        car.onLivesChanged = { [weak self] lives, max in
-            self?.healthHUD.setLives(left: lives, max: max)
+        // HP changes → update both HUDs
+        car.onHPChanged = { [weak self] hp, max in
+            guard let self else { return }
+            self.updateHealthHUD() // your existing top-left HUD
         }
-        // initial draw
+        
+        // Lives changes → update both HUDs
+        car.onLivesChanged = { [weak self] lives, max in
+            guard let self else { return }
+            self.healthHUD.setLives(left: lives, max: max)    // existing
+        }
+        
+        // Initial draw (keep these after you set closures)
+        car.onHPChanged?(car.hp, car.maxHP)
         healthHUD.setLives(left: car.livesLeft, max: car.maxLives)
+        
+        car.enableCrashContacts()
         
         // Show handedness overlay EVERY time app opens (but don't block controls)
         showHandednessPicker()
@@ -358,6 +413,13 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
             self.car.restartAfterGameOver(at: spawn)
             self.cameraFrozenPos = nil
             self.resumeWorldAfterRespawn()
+        }
+        
+        // Example: spawn 3 basic enemies that chase the player
+        for _ in 0..<1 {
+            let p = safeSpawnPoint(in: cameraWorldRect(margin: 500).insetBy(dx: 150, dy: 150),
+                                   radius: spawnClearance)
+            _ = spawnEnemy(at: p)
         }
     }
     
@@ -390,6 +452,49 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         placeDriveButton()
         handednessOverlay?.updateSize(size)
         reflowEnhancementHUD()
+    }
+    
+    @objc private func handlePinch(_ gr: UIPinchGestureRecognizer) {
+        // Do nothing while any control is held; also reset scale accumulation
+        if isAnyControlActive {
+            if gr.state == .changed { gr.scale = 1 } // avoid jump later
+            return
+        }
+        
+        guard let cam = camera, view != nil else { return }
+        switch gr.state {
+        case .began:
+            pinchStartScale = cam.xScale
+        case .changed, .ended:
+            let target = pinchStartScale * gr.scale
+            setZoom(target, forceStreamRefresh: gr.state == .ended)
+        default:
+            break
+        }
+    }
+    
+    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        // Block pinch from even starting if controls are down
+        if gestureRecognizer === pinchGR { return !isAnyControlActive }
+        return true
+    }
+    
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+        // Keep pinch exclusive while it runs (safer on HUD)
+        return false
+    }
+    
+    private var moveControlActive = false
+    private var fireControlActive = false
+    private var isAnyControlActive: Bool { moveControlActive || fireControlActive }
+    
+    func setMoveControl(active: Bool) { moveControlActive = active }
+    func setFireControl(active: Bool) { fireControlActive = active }
+    
+    override func willMove(from view: SKView) {
+        if let g = pinchGR { view.removeGestureRecognizer(g) }
+        super.willMove(from: view)
     }
     
     // MARK: - Speed ring
@@ -728,7 +833,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         // Health (under speed)
         healthHUD.position = CGPoint(
             x: -size.width * 0.5 + margin + 80,
-            y:  size.height * 0.5 - (margin + drop) - speedCard.frame.height - 18
+            y:  size.height * 0.5 - (margin + drop) - speedCard.frame.height - 38
         )
     }
     
@@ -948,7 +1053,10 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
                 car.startAutoFire(on: self)
                 setFiring(true)                 // ← color ON
                 animateFireTap()
+                setFireControl(active: true)
                 continue
+            } else {
+                setFireControl(active: false)
             }
             
             // NEW: Drive button press → center ring on the button
@@ -967,7 +1075,10 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
                 ringHandle.position = .zero
                 animateDriveTap()
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                setMoveControl(active: true)
                 continue
+            } else {
+                setMoveControl(active: false)
             }
             
             if driveTouch == nil {
@@ -989,6 +1100,13 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 }
             }
+        }
+        
+        for t in touches {
+            let p = t.location(in: self)
+            
+            if fireButton.contains(p) { setMoveControl(active: true) }
+            if driveButton.contains(p) { setFireControl(active: true) }
         }
     }
     
@@ -1041,6 +1159,9 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
                                     highlight: .systemTeal)
             }
         }
+        
+        setMoveControl(active: false)
+        setFireControl(active: false)
     }
     
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -1244,11 +1365,14 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     }
     
     private func cameraWorldRect(margin: CGFloat) -> CGRect {
-        let camPos = camera?.position ?? .zero
-        return CGRect(x: camPos.x - size.width/2  - margin,
-                      y: camPos.y - size.height/2 - margin,
-                      width:  size.width  + margin * 2,
-                      height: size.height + margin * 2)
+        let camPos   = camera?.position ?? .zero
+        let camScale = camera?.xScale ?? 1.0
+        let w = size.width  * camScale
+        let h = size.height * camScale
+        return CGRect(x: camPos.x - w/2 - margin,
+                      y: camPos.y - h/2 - margin,
+                      width:  w + margin * 2,
+                      height: h + margin * 2)
     }
     
     private func chunkRange(for rect: CGRect) -> (cx0: Int, cx1: Int, cy0: Int, cy1: Int) {
@@ -1896,13 +2020,12 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         }
         
         // Keep the vertical axis in sync with terrain (smooth hill profile)
-        let gh = groundHeight(at: car.position)
-        applyHillModifiers(gh: gh)
-        car.stepVertical(dt: dt, groundHeight: gh)
-        
-        car.update(dt)
-        
-        car.update(dt)
+        for car in cars {
+            let gh = groundHeight(at: car.position)
+            applyHillModifiers(for: car, gh: gh)
+            car.stepVertical(dt: dt, groundHeight: gh)
+            car.update(dt)
+        }
         
         _preCarVel = car.physicsBody?.velocity ?? .zero   // ← NEW
         _lastDTForClamp = dt
@@ -1930,42 +2053,29 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         return 0.5 * sqrt(hx*hx + hy*hy)
     }
     
-    private func applyHillModifiers(gh: CGFloat) {
-        // Treat tiny residual heights at the base as flat → no penalties
-        if gh < 16 {
+    @inline(__always)
+    private func applyHillModifiers(for car: CarNode, gh: CGFloat) {
+        if gh < 16 {                     // flat → no penalties
             car.hillSpeedMul = 1
             car.hillAccelMul = 1
             car.hillDragK    = 0
             return
         }
+        let gvec = groundGradient(at: car.position)
+        let gmag = hypot(gvec.dx, gvec.dy) * 0.5
+        let slope = min(1, gmag / 28.0)
         
-        let gvec = groundGradient(at: car.position)           // ∇h (uphill)
-        let gmag = hypot(gvec.dx, gvec.dy) * 0.5              // same scale as groundGradientMagnitude
-        let slope = min(1, gmag / 28.0)                       // 0 on flat → 1 on steep rim
-        
-        // Forward / downhill alignment
         let heading = car.zRotation + .pi/2
         let fwd = CGVector(dx: cos(heading), dy: sin(heading))
-        var down = CGVector(dx: -gvec.dx, dy: -gvec.dy)       // downhill
-        let dLen = max(1e-6, hypot(down.dx, down.dy))
-        down.dx /= dLen; down.dy /= dLen
-        let alignDown = max(0, fwd.dx * down.dx + fwd.dy * down.dy)   // 0…1
+        let down = CGVector(dx: -gvec.dx, dy: -gvec.dy)
         
-        // Base hill penalties are now gentler
-        var speedMul = 0.85 - 0.20 * slope                     // 0.65…0.85 (was 0.35…0.58)
-        var accelMul = 0.95 - 0.45 * slope                     // 0.50…0.95 (was 0.50…0.75)
-        var dragK    = 0.6  + 1.4  * slope                     // lighter extra drag
+        let downhillAlign = max(0, (fwd.dx * down.dx + fwd.dy * down.dy) / max(0.001, hypot(down.dx, down.dy)))
+        let uphillAlign   = max(0, -downhillAlign)
         
-        // Downhill assist: reduce penalties and add "free" acceleration down the slope
-        // (implemented by raising accelMul toward/above 1 when aligned downhill)
-        let assist = alignDown * slope                         // 0…1 only if pointing downhill
-        speedMul = min(1.00, speedMul + 0.22 * assist)         // loosen cap when rolling down
-        accelMul = min(1.20, accelMul + 0.55 * assist)         // push down the hill
-        dragK    = max(0.0, dragK * (1.0 - 0.55 * assist))     // less drag when going with gravity
-        
-        car.hillSpeedMul = speedMul
-        car.hillAccelMul = accelMul
-        car.hillDragK    = dragK
+        // match your original tuning:
+        car.hillSpeedMul = 1 - 0.30 * slope * uphillAlign
+        car.hillAccelMul = 1 - 0.45 * slope * uphillAlign
+        car.hillDragK    =  1.20 * slope * (1 - downhillAlign)   // small extra drag unless fully downhill
     }
     
     // ─────────────────────────────────────────────────────────────────────────────
@@ -2759,24 +2869,14 @@ extension GameScene: CarShieldReporting, CarWeaponReporting, CarStatusReporting 
     }
     
     func onMiniModeChanged(_ active: Bool) {
-        enhancementHUD.setPersistent(.shrink, active: true)
+        enhancementHUD.setPersistent(.shrink, active: active)
         
+        // Only scale; no ring/poof or pulse UI on the car
         let target: CGFloat = active ? 0.9 : 1.0
         car.removeAction(forKey: "miniScale")
         let scale = SKAction.scale(to: target, duration: 0.18)
         scale.timingMode = .easeOut
         car.run(scale, withKey: "miniScale")
-        
-        // pulse once when enabling
-        car.removeAction(forKey: "miniPulse")
-        if active {
-            playShrinkPoof(at: car.position)
-            let up = SKAction.scale(to: target * 1.08, duration: 0.18)
-            up.timingMode = .easeOut
-            let dn = SKAction.scale(to: target, duration: 0.16)
-            dn.timingMode = .easeIn
-            car.run(.sequence([up, dn]), withKey: "miniPulse")
-        }
     }
 }
 
@@ -2887,5 +2987,16 @@ extension GameScene {
         
         let c = (activeBand >= 0 && activeBand < ringPalette.count) ? ringPalette[activeBand] : .systemTeal
         setDriveArrowColors(up: up, down: down, left: left, right: right, highlight: c)
+    }
+}
+
+extension CarNode: CarEnhancementResetting {
+    func resetEnhancements() {
+        weaponMod = .none
+        shield = 0
+        controlBoostActive = false
+        miniModeActive = false
+        refreshMiniHUD()
+        // Let the scene HUDs sync (callbacks already fire in the setters).
     }
 }

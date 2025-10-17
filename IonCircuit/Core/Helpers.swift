@@ -6,7 +6,7 @@
 //
 
 import Foundation
-internal import CoreGraphics
+import CoreGraphics
 import UIKit
 import SpriteKit
 
@@ -27,6 +27,8 @@ func smoothstep(_ edge0: CGFloat, _ edge1: CGFloat, _ x: CGFloat) -> CGFloat {
 // Tiny sign helper used in the steering code
 @inline(__always)
 func sign(_ v: CGFloat) -> CGFloat { v >= 0 ? 1 : -1 }
+
+func clamp<T: Comparable>(_ v: T, _ lo: T, _ hi: T) -> T { Swift.max(lo, Swift.min(hi, v)) }
 
 extension CGRect {
     var center: CGPoint { CGPoint(x: midX, y: midY) }
