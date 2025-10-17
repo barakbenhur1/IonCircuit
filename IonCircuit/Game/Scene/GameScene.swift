@@ -1895,7 +1895,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         let x = isLeftHanded
         ? ( size.width * 0.5 - margin - R + 15)   // Left-handed → Fire RIGHT
         : (-size.width * 0.5 + margin + R - 15)   // Right-handed → Fire LEFT
-        fireButton.position = CGPoint(x: x, y: -size.height * 0.5 + margin + R)
+        fireButton.position = CGPoint(x: x - 10, y: -size.height * 0.5 + margin + R + 20)
     }
     
     private func placeDriveButton() {
@@ -1904,7 +1904,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         let x = isLeftHanded
         ? (-size.width * 0.5 + margin + R - 15)   // Left-handed → Drive LEFT
         : ( size.width * 0.5 - margin - R + 15)   // Right-handed → Drive RIGHT
-        driveButton.position = CGPoint(x: x, y: -size.height * 0.5 + margin + R)
+        driveButton.position = CGPoint(x: x + 10, y: -size.height * 0.5 + margin + R + 20)
     }
     
     // MARK: - Update
@@ -2049,6 +2049,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         
         // Keep the vertical axis in sync with terrain (smooth hill profile)
         for car in cars {
+            if car.kind == .enemy { car.runEnemyAI(dt) }
             let gh = groundHeight(at: car.position)
             applyHillModifiers(for: car, gh: gh)
             car.stepVertical(dt: dt, groundHeight: gh)
@@ -2780,15 +2781,21 @@ extension GameScene {
     
     // MARK: - Raycast helper (closest hit on target's subtree)
     private func rayHitPoint(on target: SKNode, start: CGPoint, end: CGPoint) -> CGPoint? {
-        var best: (dist: CGFloat, point: CGPoint)?
-        physicsWorld.enumerateBodies(alongRayStart: start, end: end) { body, point, _, _ in
-            guard (body.categoryBitMask & Category.obstacle) != 0 else { return }
-            guard let n = body.node else { return }
-            guard n.inParentHierarchy(target) || target.inParentHierarchy(n) else { return }
-            let d = hypot(point.x - start.x, point.y - start.y)
-            if best == nil || d < best!.dist { best = (d, point) }
-        }
-        return best?.point
+        let dx = end.x - start.x, dy = end.y - start.y
+           if (dx*dx + dy*dy) < 1e-6 {
+               return nil
+           }
+
+           var best: (dist: CGFloat, point: CGPoint)?
+           physicsWorld.enumerateBodies(alongRayStart: start, end: end) { body, point, _, _ in
+               guard (body.categoryBitMask & (Category.obstacle | Category.wall | Category.ramp)) != 0 else { return }
+               guard let n = body.node else { return }
+               guard n.inParentHierarchy(target) || target.inParentHierarchy(n) else { return }
+
+               let d = hypot(point.x - start.x, point.y - start.y)
+               if best == nil || d < best!.dist { best = (d, point) }
+           }
+           return best?.point
     }
     
     // MARK: - Open ground sampler

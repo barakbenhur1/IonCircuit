@@ -51,8 +51,8 @@ final class CarNode: SKNode {
     var acceleration: CGFloat = 1240.0
     var maxSpeed: CGFloat     = 2720.0
     var reverseSpeedFactor: CGFloat = 0.55
-    var turnRate: CGFloat     = 4.2
-    var traction: CGFloat     = 12.0
+    var turnRate: CGFloat     = 2.2
+    var traction: CGFloat     = 7.0
     var drag: CGFloat         = 1.0
     var brakeForce: CGFloat   = 2200.0
     var speedCapBonus: CGFloat = 0
@@ -94,6 +94,17 @@ final class CarNode: SKNode {
     private let miniShieldBar  = SKShapeNode()    // overlay (blue) above HP
     private let miniLivesNode = SKNode()
     private var heartNodes: [SKShapeNode] = []
+    
+    // MARK: - Enemy AI state
+
+    private enum AIState { case attack, collect, evade }
+    private var aiState: AIState = .attack
+    private var aiStateLockUntil: CFTimeInterval = 0           // prevents rapid thrashing
+    private var aiGoalNode: SKNode?                            // current enhancement target
+    private var aiOrbitSign: CGFloat = (Bool.random() ? 1 : -1)
+
+    private var _aiStuckT: CGFloat = 0
+    private var _aiReverseUntil: CFTimeInterval = 0
     
     private struct MiniUI {
         static let hpW: CGFloat = 60
@@ -1196,11 +1207,208 @@ extension CarNode {
         while d < -.pi { d += (.pi * 2) }
         return d
     }
+}
+
+// MARK: - Role & Simple AI
+extension CarNode {
     
+    // ── lightweight per-enemy AI state (via ObjC assoc) ───────────────────────
+    private struct AIAssoc { static var lastPos = 0, stuckT = 0, reverseUntil = 0 }
+    private var _aiLastPos: CGPoint {
+        get { (objc_getAssociatedObject(self, &AIAssoc.lastPos) as? NSValue)?.cgPointValue ?? .zero }
+        set { objc_setAssociatedObject(self, &AIAssoc.lastPos, NSValue(cgPoint: newValue), .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
+    }
+
     func runEnemyAI(_ dt: CGFloat) {
-        if isDead { throttle = 0; steer = 0.001; return }
-        guard physicsBody != nil else { return }
-        // (basic AI intentionally left commented out for now)
+        guard kind == .enemy, !isDead, dt > 0,
+              let scn = scene, let pb = physicsBody, let tgt = aiTarget else { return }
+        
+        // --- common values ---
+        let heading = zRotation + .pi/2
+        let f = CGVector(dx: cos(heading), dy: sin(heading))
+        let v = pb.velocity
+        let speed = hypot(v.dx, v.dy)
+        let myPos = position
+        let tgtPos = tgt.position
+        let distToPlayer = hypot(tgtPos.x - myPos.x, tgtPos.y - myPos.y)
+        let hpFrac = CGFloat(hp) / CGFloat(maxHP)
+        
+        // ---- helpers (local) ----
+        @inline(__always)
+        func nonZeroRay(start: CGPoint, dir: CGVector, len: CGFloat) -> (CGPoint, CGPoint)? {
+            let L = max(2, len)                               // avoid zero-length
+            if L < 2 { return nil }
+            let end = CGPoint(x: start.x + dir.dx * L, y: start.y + dir.dy * L)
+            if start == end { return nil }
+            return (start, end)
+        }
+        
+        @inline(__always)
+        func clearSight(to p: CGPoint) -> Bool {
+            let mask: UInt32 = Category.wall | Category.obstacle | Category.hole | Category.ramp
+            var blocked = false
+            if hypot(p.x - myPos.x, p.y - myPos.y) < 2 { return true }
+            scn.physicsWorld.enumerateBodies(alongRayStart: myPos, end: p) { body, _, _, stop in
+                if let c = body.node as? CarNode, c === tgt { stop.pointee = true; return }
+                if (body.categoryBitMask & mask) != 0 { blocked = true; stop.pointee = true }
+            }
+            return !blocked
+        }
+        
+        @inline(__always)
+        func firstHitDist(dirAngle: CGFloat, look: CGFloat) -> CGFloat {
+            guard look > 2 else { return .greatestFiniteMagnitude }
+            let dir = CGVector(dx: cos(dirAngle), dy: sin(dirAngle))
+            guard let (s, e) = nonZeroRay(start: myPos, dir: dir, len: look) else {
+                return .greatestFiniteMagnitude
+            }
+            let mask: UInt32 = Category.wall | Category.obstacle | Category.hole
+            var d: CGFloat = .greatestFiniteMagnitude
+            scn.physicsWorld.enumerateBodies(alongRayStart: s, end: e) { body, point, _, stop in
+                if (body.categoryBitMask & mask) != 0 && body.node !== self {
+                    d = hypot(point.x - myPos.x, point.y - myPos.y)
+                    stop.pointee = true
+                }
+            }
+            return d
+        }
+        
+        func nearestEnhancement() -> SKNode? {
+            let wantMask: UInt32 = Category.enhancements
+            var best: (CGFloat, SKNode)?
+            // BFS walk so we don't miss nested nodes
+            var stack: [SKNode] = [scn]
+            while let n = stack.popLast() {
+                for c in n.children {
+                    if let cat = c.physicsBody?.categoryBitMask, (cat & wantMask) != 0 {
+                        let d = hypot(c.position.x - myPos.x, c.position.y - myPos.y)
+                        if best == nil || d < best!.0 { best = (d, c) }
+                    }
+                    if !c.children.isEmpty { stack.append(c) }
+                }
+            }
+            return best?.1
+        }
+        
+        // --- state selection (every ~0.6s to avoid flapping) ---
+        let now = CACurrentMediaTime()
+        if now > aiStateLockUntil {
+            let nearDanger = distToPlayer < 260 && clearSight(to: tgtPos)
+            let shouldEvade = hpFrac < 0.35 || (hpFrac < 0.55 && nearDanger)
+            
+            if shouldEvade {
+                aiState = .evade
+                aiGoalNode = nil
+            } else if let enh = nearestEnhancement() {
+                // go for it if not too risky or we're not full HP
+                let d = hypot(enh.position.x - myPos.x, enh.position.y - myPos.y)
+                if d < 1000 && (hpFrac < 0.90 || d < distToPlayer * 0.9) && clearSight(to: enh.position) {
+                    aiState = .collect
+                    aiGoalNode = enh
+                } else {
+                    aiState = .attack
+                    aiGoalNode = nil
+                }
+            } else {
+                aiState = .attack
+                aiGoalNode = nil
+            }
+            aiStateLockUntil = now + 0.6
+        }
+        
+        // --- movement control targets ---
+        var steerCmd: CGFloat = 0
+        var throttleCmd: CGFloat = 0.5
+        
+        // common avoidance
+        let look = min(420, 100 + speed * 0.18)
+        let dF = firstHitDist(dirAngle: heading,           look: look)
+        let dL = firstHitDist(dirAngle: heading + .pi/7.0, look: look)
+        let dR = firstHitDist(dirAngle: heading - .pi/7.0, look: look)
+        let leftPressure  = (look - min(dL, look)) / look
+        let rightPressure = (look - min(dR, look)) / look
+        let avoidSteer = CGFloat.clamp(rightPressure - leftPressure, -0.6, 0.6)
+        
+        // --- behaviors ---
+        switch aiState {
+            
+        case .attack:
+            // small lead on the target
+            let leadT: CGFloat = 0.12
+            let tp = tgt.position
+            let tv = tgt.physicsBody?.velocity ?? .zero
+            let aim = CGPoint(x: tp.x + tv.dx * leadT, y: tp.y + tv.dy * leadT)
+            
+            let desired = atan2(aim.y - myPos.y, aim.x - myPos.x)
+            let angErr  = shortestAngle(from: heading, to: desired)
+            steerCmd = tanh(1.2 * (angErr / (.pi/3))) + avoidSteer
+            
+            let fwdSpd = max(0, v.dx * f.dx + v.dy * f.dy)
+            let far: CGFloat = 1100, near: CGFloat = 420
+            let targetSpd: CGFloat =
+            (distToPlayer > far)  ? maxSpeed * 0.80 :
+            (distToPlayer > near) ? maxSpeed * (0.30 + 0.40 * (distToPlayer - near)/(far - near)) :
+            0.0
+            throttleCmd = CGFloat.clamp((targetSpd - fwdSpd) / 560, 0, 0.75)
+            if dF < look * 0.75 { throttleCmd *= max(0.25, dF / (look * 0.75)) }
+            
+        case .collect:
+            // If our chosen enhancement vanished, revert to attack next tick.
+            if aiGoalNode?.parent == nil { aiStateLockUntil = 0 }
+            
+            let gp = aiGoalNode?.position ?? myPos
+            let desired = atan2(gp.y - myPos.y, gp.x - myPos.x)
+            let angErr  = shortestAngle(from: heading, to: desired)
+            steerCmd = tanh(1.0 * (angErr / (.pi/3))) + avoidSteer
+            
+            throttleCmd = 0.55
+            if hypot(gp.x - myPos.x, gp.y - myPos.y) < 70 { throttleCmd = 0.2 } // ease in
+            if dF < look * 0.65 { throttleCmd *= max(0.25, dF / (look * 0.65)) }
+            
+        case .evade:
+            // choose a safe direction roughly away from the player
+            let away = atan2(myPos.y - tgtPos.y, myPos.x - tgtPos.x)
+            var bestAngle = away
+            var bestScore: CGFloat = -1
+            
+            // sample angles around "away", prefer clearance + alignment with away
+            let samples: [CGFloat] = [-.pi/3, -.pi/6, -.pi/9, 0, .pi/9, .pi/6, .pi/3]
+            for s in samples {
+                let a = away + s
+                let clearance = firstHitDist(dirAngle: a, look: look)
+                let align = cos(s)                                  // 1 when exactly away
+                let score = min(clearance, look) + 120 * max(0, align)
+                if score > bestScore { bestScore = score; bestAngle = a }
+            }
+            
+            let angErr = shortestAngle(from: heading, to: bestAngle)
+            steerCmd = tanh(1.3 * (angErr / (.pi/2))) + avoidSteer
+            throttleCmd = 0.9
+            if dF < look * 0.5 { throttleCmd = 0.6 }               // don't nose into walls
+        }
+        
+        // --- stuck recovery (gentle) ---
+        if speed < 22 { _aiStuckT += dt } else { _aiStuckT = max(0, _aiStuckT - dt * 0.6) }
+        if _aiStuckT > 1.0 && _aiReverseUntil < now {
+            _aiReverseUntil = now + 0.40
+            _aiStuckT = 0.25
+        }
+        if now < _aiReverseUntil {
+            throttle = -0.65
+            steer    = steerCmd + (dL > dR ? 0.6 : -0.6)
+        } else {
+            throttle = throttleCmd
+            steer    = steerCmd
+        }
+        
+        // --- shooting policy ---
+        let desiredToPlayer = atan2(tgtPos.y - myPos.y, tgtPos.x - myPos.x)
+        let aimErr = abs(shortestAngle(from: heading, to: desiredToPlayer))
+        let canShoot = (aiState != .evade) && distToPlayer < 800 && aimErr < (.pi/18) && clearSight(to: tgtPos)
+        if canShoot { startAutoFire(on: scn) } else { stopAutoFire() }
+        
+        // keep mini HUD upright
+        miniHUD.zRotation = -zRotation
     }
 }
 
