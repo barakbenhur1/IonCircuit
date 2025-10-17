@@ -35,7 +35,7 @@ final class ObstacleNode: SKNode {
     init(kind: ObstacleKind) {
         self.kind = kind
         if ObstacleNode.isDestructible(kind) {
-            let m = ObstacleNode.defaultHP[kind] ?? 3
+            let m = ObstacleNode.defaultHP[kind] ?? 64
             self.maxHP = m
             self.hp = m
         } else {
@@ -50,10 +50,10 @@ final class ObstacleNode: SKNode {
     
     // MARK: Tunables
     static let defaultHP: [ObstacleKind: Int] = [
-        .cone: 2,
-        .barrel: 3,
-        .rock: 4,
-        .barrier: 5
+        .cone: 16,
+        .barrel: 32,
+        .rock: 80,
+        .barrier: 120
     ]
     static func isDestructible(_ k: ObstacleKind) -> Bool {
         switch k {

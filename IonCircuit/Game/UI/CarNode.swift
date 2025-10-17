@@ -807,7 +807,7 @@ extension CarNode {
         switch weaponMod { case .rapid: return 0.12; default: return 0.24 }
     }
     private var currentBulletDamage: Int {
-        switch weaponMod { case .damage: return 3; default: return 1 }
+        switch weaponMod { case .damage: return 12; default: return 8 }
     }
     private var muzzleOffset: CGFloat { 26 }
     

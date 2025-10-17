@@ -160,6 +160,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
     private let healthHUD = CarHealthHUDNode()
     private let enhancementHUD = EnhancementHUDNode()
     private let gameOverOverlay = GameOverOverlayNode()
+    private let winOverlay = WinOverlayNode()
     
     private var minZoom: CGFloat = 1.0   // max zoom OUT (see more map)
     private var maxZoom: CGFloat = 2.4   // max zoom IN
@@ -190,7 +191,6 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         isTouching = false
         controlArmed = false
         car.stopAutoFire()
-        setFiring(false)              // ← ensure fire color resets
         hideRing()
         
         // freeze simulation
@@ -396,27 +396,24 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         showHandednessPicker()
         setupEnhancementHUD()
         
-        // After you create the camera node `cam`
+        // After: let cam = SKCameraNode(); camera = cam; addChild(cam)
         cam.addChild(gameOverOverlay)
-        
-        // restart handler
+        cam.addChild(winOverlay)
+
+        // Restart handler (player lost)
         gameOverOverlay.onRestart = { [weak self] in
             guard let self = self else { return }
             self.gameOverOverlay.hide()
-            
-            // get a safe spawn in the camera’s visible area
-            let spawn = self.safeSpawnPoint(
-                in: self.cameraWorldRect(margin: 400).insetBy(dx: 120, dy: 120),
-                radius: self.spawnClearance
-            )
-            
-            // reset the car + world
-            self.car.restartAfterGameOver(at: spawn)
-            self.cameraFrozenPos = nil
-            self.resumeWorldAfterRespawn()
+            self.restartRound()      // see helper below
+        }
+
+        // Restart handler (player won)
+        winOverlay.onRestart = { [weak self] in
+            guard let self = self else { return }
+            self.winOverlay.hide()
+            self.restartRound()
         }
         
-        // Example: spawn 3 basic enemies that chase the player
         for _ in 0..<1 {
             let p = safeSpawnPoint(in: cameraWorldRect(margin: 500).insetBy(dx: 150, dy: 150),
                                    radius: spawnClearance)
@@ -424,6 +421,36 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         }
     }
     
+    private func restartRound() {
+        // Hide overlays if still up
+        gameOverOverlay.hide()
+        winOverlay.hide()
+
+        // Choose a safe spawn in the current camera area
+        let spawn = safeSpawnPoint(in: cameraWorldRect(margin: 400).insetBy(dx: 120, dy: 120),
+                                   radius: spawnClearance)
+
+        // Reset player
+        car.restartAfterGameOver(at: spawn)
+
+        // Despawn existing enemies
+        for e in cars where e !== car {
+            e.removeAllActions()
+            e.removeFromParent()
+        }
+        cars = [car]
+
+        // (Optional) Respawn some enemies
+        for _ in 0..<1 {
+            let p = safeSpawnPoint(in: cameraWorldRect(margin: 500).insetBy(dx: 150, dy: 150),
+                                   radius: spawnClearance)
+            _ = spawnEnemy(at: p)
+        }
+
+        cameraFrozenPos = nil
+        resumeWorldAfterRespawn()
+    }
+
     private func setupEnhancementHUD() {
         guard let cam = camera else { return }
         if enhancementHUD.parent == nil {
@@ -1017,10 +1044,23 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
     }
     
     func carNodeDidRunOutOfLives(_ car: CarNode) {
-        // Camera is already frozen + world paused from carNodeDidExplode(_:)
-        // Just show the overlay.
-        if let cam = camera {
+        guard let cam = camera else { return }
+
+        if car.kind == .player {
+            // Player lost → freeze and show Game Over
+            cameraFrozenPos = self.car.position
+            pauseWorldForDeath()
             gameOverOverlay.show(in: cam, size: size)
+            return
+        }
+
+        // An enemy lost all lives → check if any enemy still alive
+        let anyEnemyStillAlive = cars.contains { $0.kind == .enemy && $0.livesLeft > 0 }
+        if !anyEnemyStillAlive {
+            // Pause now (we didn’t pause on enemy explode)
+            cameraFrozenPos = self.car.position
+            pauseWorldForDeath()
+            winOverlay.show(in: cam, size: size)
         }
     }
     
@@ -1034,9 +1074,8 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let t = touches.first else { return }
         // If overlay is visible, let it consume the touch first
-        if !gameOverOverlay.isHidden {
-            if gameOverOverlay.handleTouch(scenePoint: t.location(in: self)) { return }
-        }
+        if !gameOverOverlay.isHidden, gameOverOverlay.handleTouch(scenePoint: t.location(in: self)) { return }
+        if !winOverlay.isHidden,   winOverlay.handleTouch(scenePoint: t.location(in: self))         { return }
         
         if controlsLockedForOverlay || pausedForDeath { return }   // NEW guard
         guard let cam = camera else { return }
@@ -2350,6 +2389,7 @@ extension GameScene: CarNodeDelegate {
     func carNodeDidExplode(_ car: CarNode, at position: CGPoint) {
         // your existing explode handling (camera shake, freeze, etc.)
         freezeCamera(at: car.position) // if you already have this helper
+        pauseWorldForDeath()
     }
     
     private func freezeCamera(at pos: CGPoint) {
