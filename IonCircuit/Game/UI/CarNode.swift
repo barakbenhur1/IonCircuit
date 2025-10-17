@@ -48,13 +48,13 @@ final class CarNode: SKNode {
     }
     
     // ---- Tuning ----
-    var acceleration: CGFloat = 540.0
-    var maxSpeed: CGFloat     = 1520.0
+    var acceleration: CGFloat = 1240.0
+    var maxSpeed: CGFloat     = 2720.0
     var reverseSpeedFactor: CGFloat = 0.55
     var turnRate: CGFloat     = 4.2
     var traction: CGFloat     = 12.0
     var drag: CGFloat         = 1.0
-    var brakeForce: CGFloat   = 1300.0
+    var brakeForce: CGFloat   = 2200.0
     var speedCapBonus: CGFloat = 0
     
     // Controls [-1, 1]
@@ -145,6 +145,9 @@ final class CarNode: SKNode {
             h.strokeColor = UIColor.black.withAlphaComponent(0.25)
             h.lineWidth = 0.6
             h.zPosition = 2
+            h.name = "lifeHeart"                 // helps the name check
+            if h.userData == nil { h.userData = NSMutableDictionary() }
+            h.userData?["noTint"] = true         // hard guard used above
             miniLivesNode.addChild(h)
             heartNodes.append(h)
         }
@@ -336,9 +339,9 @@ final class CarNode: SKNode {
         pb.angularDamping = 2.0
         pb.affectedByGravity = false
         pb.usesPreciseCollisionDetection = true
-        pb.categoryBitMask = Category.car
-        pb.collisionBitMask = Category.wall | Category.obstacle
-        pb.contactTestBitMask = Category.hole | Category.obstacle | Category.ramp
+        pb.categoryBitMask      = Category.car
+        pb.collisionBitMask     = Category.wall | Category.obstacle | Category.car   // ← add .car
+        pb.contactTestBitMask   = Category.hole | Category.obstacle | Category.ramp | Category.car // ← add .car
         self.physicsBody = pb
         
         zRotation = 0
@@ -843,8 +846,17 @@ extension CarNode {
             let muzzleWorld = convert(CGPoint(x: 0, y: muzzleOffset), to: scene)
             let dir = CGVector(dx: cos(angle), dy: sin(angle))
             let b = BulletNode(style: style, damage: currentBulletDamage)
+            b.name = "bullet"
             b.zRotation = angle
             b.position  = muzzleWorld
+            
+            b.physicsBody?.categoryBitMask      = Category.bullet
+            b.physicsBody?.collisionBitMask     = 0               // usually no physical push
+            b.physicsBody?.contactTestBitMask   = Category.obstacle | Category.wall | Category.ramp | Category.car
+            // Optional: tag the shooter so you can ignore self-hits (see userData read above)
+            b.userData = (b.userData ?? NSMutableDictionary())
+            b.userData?["owner"] = self
+            
             scene.addChild(b)
             
             let vCar = pb.velocity
@@ -965,24 +977,63 @@ extension CarNode {
     
     func enableCrashContacts() {
         guard let pb = physicsBody else { return }
-        pb.contactTestBitMask |= (Category.obstacle | Category.wall)
+        pb.contactTestBitMask |= (Category.obstacle | Category.wall | Category.car) // ← add .car
     }
     
-    // Contact → damage
+    func handleCrash(contact: SKPhysicsContact, other: SKPhysicsBody, damage: Int) {
+        guard let pb = physicsBody, !isDead else { return }
+
+         // --- Always do a small bounce (walls, hills, obstacles, cars) ---
+         let hitPoint = contact.contactPoint
+
+         // outward-ish normal
+         var n = CGVector(dx: position.x - hitPoint.x, dy: position.y - hitPoint.y)
+         var len = hypot(n.dx, n.dy)
+         if len < 1e-5 {
+             // fallback: opposite relative velocity
+             let rel = CGVector(dx: pb.velocity.dx - other.velocity.dx,
+                                dy: pb.velocity.dy - other.velocity.dy)
+             n = CGVector(dx: -rel.dx, dy: -rel.dy)
+             len = max(1e-5, hypot(n.dx, n.dy))
+         }
+         n.dx /= len; n.dy /= len
+
+         // scale with approach speed a bit
+         let rel = CGVector(dx: pb.velocity.dx - other.velocity.dx,
+                            dy: pb.velocity.dy - other.velocity.dy)
+         let approach = max(0, -(rel.dx * n.dx + rel.dy * n.dy))
+         var j = 15 + 0.25 * approach                  // tune feel
+         j = CGFloat.clamp(j, 5, 20)
+         pb.applyImpulse(CGVector(dx: n.dx * j, dy: n.dy * j))
+
+         // trim inward component so we don't stick
+         var v = pb.velocity
+         let inward = -(v.dx * n.dx + v.dy * n.dy)
+         if inward > 0 {
+             v.dx += n.dx * inward
+             v.dy += n.dy * inward
+             pb.velocity = v
+         }
+
+         // --- Damage rules: walls & hills (and ramps) do NOT damage ---
+         let isWall = (other.categoryBitMask & Category.wall) != 0
+         let isRamp = (other.categoryBitMask & Category.ramp) != 0
+         let isHill = (other.node is HillNode)
+         let noDamage = isWall || isHill || isRamp
+         if noDamage { return }
+
+         // i-frames for damaging hits only
+         let now = CACurrentMediaTime()
+         let iFrame: TimeInterval = 0.12
+         if now - lastHitTime < iFrame { return }
+         lastHitTime = now
+        applyDamage(damage, hitWorldPoint: hitPoint)
+    }
+    
     func handleCrash(contact: SKPhysicsContact, other: SKPhysicsBody) {
-        if (other.categoryBitMask & Category.ramp) != 0 { return }
-        if other.node is HillNode { return }
-        
-        if isDead { return }
-        let now = CACurrentMediaTime()
-        let iFrame: TimeInterval = 0.12
-        if now - lastHitTime < iFrame { return }
-        lastHitTime = now
-        
-        let hitPoint = contact.contactPoint
-        applyDamage(10, hitWorldPoint: hitPoint)
+        handleCrash(contact: contact, other: other, damage: 10)
     }
-    
+
     func playHitFX(at worldPoint: CGPoint?) {
         removeAction(forKey: "hitFX")
         let bumpUp = SKAction.scale(to: 1.08, duration: 0.08); bumpUp.timingMode = .easeOut
@@ -1045,9 +1096,9 @@ extension CarNode {
                 self.physicsBody?.velocity = .zero
                 
                 if let pb = self.physicsBody {
-                    pb.categoryBitMask = Category.car
-                    pb.collisionBitMask = Category.wall | Category.obstacle
-                    pb.contactTestBitMask = Category.hole | Category.obstacle | Category.ramp
+                    pb.categoryBitMask    = Category.car
+                    pb.collisionBitMask   = Category.wall | Category.obstacle | Category.car      // ← add .car
+                    pb.contactTestBitMask = Category.hole | Category.obstacle | Category.ramp | Category.car // ← add .car
                     self.enableCrashContacts()
                 }
                 
@@ -1071,9 +1122,9 @@ extension CarNode {
         if let pb = physicsBody {
             pb.velocity = .zero
             pb.angularVelocity = 0
-            pb.categoryBitMask = Category.car
-            pb.collisionBitMask = Category.wall | Category.obstacle
-            pb.contactTestBitMask = Category.hole | Category.obstacle | Category.ramp
+            pb.categoryBitMask    = Category.car
+            pb.collisionBitMask   = Category.wall | Category.obstacle | Category.car      // ← add .car
+            pb.contactTestBitMask = Category.hole | Category.obstacle | Category.ramp | Category.car // ← add .car
             enableCrashContacts()
         }
         
@@ -1185,16 +1236,25 @@ func randomDistinctColor(avoid: UIColor) -> UIColor {
     return UIColor(hue: h2, saturation: s2, brightness: b2, alpha: 1)
 }
 
-// Apply tint to all sprites under the car
 func tintCar(_ car: SKNode, to color: UIColor) {
     func visit(_ n: SKNode) {
-        if let sh = n as? SKShapeNode, sh.zPosition == 2 {
+        // If this node (or any ancestor) is marked as no-tint, skip its subtree.
+        if (n.userData?["noTint"] as? Bool) == true { return }
+        if let name = n.name?.lowercased(),
+           name.contains("heart") || name.contains("life") || name.contains("hud") {
+            return
+        }
+
+        if let sh = n as? SKShapeNode,
+           sh.zPosition == 2,                 // your original “car body” filter
+           sh.fillColor != .clear {
             sh.fillColor = color
         }
         for c in n.children { visit(c) }
     }
     visit(car)
 }
+
 
 extension CarNode {
     /// Simple kinematic controller
@@ -1247,3 +1307,12 @@ extension CarNode {
         miniHUD.zRotation = -zRotation
     }
 }
+
+extension CarNode {
+    /// Applies projectile damage (shield soaks first).
+    /// Keep it simple; the node already owns the HP/shield rules + death flow.
+    @objc func receiveProjectile(damage: Int, at point: CGPoint) {
+        applyDamage(damage, hitWorldPoint: point)
+    }
+}
+

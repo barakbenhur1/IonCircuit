@@ -8,7 +8,7 @@
 import SpriteKit
 import UIKit
 
-final class GameScene: SKScene, SKPhysicsContactDelegate {
+final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDelegate {
     // MARK: - STREAMED Obstacles / Terrain =====================================
     
     // Deterministic RNG per chunk/cell (SplitMix64)
@@ -186,6 +186,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         // stop inputs
         driveTouch = nil
         fireTouch = nil
+        refreshControlActiveFlags()
         isTouching = false
         controlArmed = false
         car.stopAutoFire()
@@ -334,8 +335,8 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         cam.position = car.position
         
         // ⬇️ Start at MAX ZOOM OUT and enable pinch zoom
-        setZoom(minZoom) // start zoomed all the way out
         pinchGR = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
+        pinchGR?.delegate = self          // ← add this
         view.addGestureRecognizer(pinchGR!)
         
         buildRampPointerIfNeeded()
@@ -455,42 +456,39 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
     }
     
     @objc private func handlePinch(_ gr: UIPinchGestureRecognizer) {
-        // Do nothing while any control is held; also reset scale accumulation
         if isAnyControlActive {
-            if gr.state == .changed { gr.scale = 1 } // avoid jump later
+            if gr.state == .changed { gr.scale = 1 }
             return
         }
-        
         guard let cam = camera, view != nil else { return }
         switch gr.state {
         case .began:
             pinchStartScale = cam.xScale
         case .changed, .ended:
-            let target = pinchStartScale * gr.scale
-            setZoom(target, forceStreamRefresh: gr.state == .ended)
-        default:
-            break
+            setZoom(pinchStartScale * gr.scale, forceStreamRefresh: gr.state == .ended)
+        default: break
         }
     }
     
-    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
-        // Block pinch from even starting if controls are down
-        if gestureRecognizer === pinchGR { return !isAnyControlActive }
+    func gestureRecognizerShouldBegin(_ g: UIGestureRecognizer) -> Bool {
+        if g === pinchGR { return !isAnyControlActive }
         return true
     }
-    
-    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+
+    func gestureRecognizer(_ g: UIGestureRecognizer,
                            shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
-        // Keep pinch exclusive while it runs (safer on HUD)
         return false
     }
     
     private var moveControlActive = false
     private var fireControlActive = false
     private var isAnyControlActive: Bool { moveControlActive || fireControlActive }
-    
-    func setMoveControl(active: Bool) { moveControlActive = active }
-    func setFireControl(active: Bool) { fireControlActive = active }
+
+    private func refreshControlActiveFlags() {
+        // Drive is active while the move touch is down (ring shown) or we’re in the legacy “car touch” mode.
+        moveControlActive = (driveTouch != nil) || (isTouching && controlArmed)
+        fireControlActive = (fireTouch != nil)
+    }
     
     override func willMove(from view: SKView) {
         if let g = pinchGR { view.removeGestureRecognizer(g) }
@@ -884,10 +882,8 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         guard !car.isAirborne, let pb = car.physicsBody else { return }
         
         // ---- Tunables (adjust to taste) ----
-        let innerBand: CGFloat   = 0.965   // r just inside the ellipse edge
         let outerBand: CGFloat   = 1.035   // r just outside the ellipse edge
         let blockOuter: CGFloat  = 1.08    // how far outside we still block inward entry
-        let minOutward: CGFloat  = 220.0   // ensure at least this outward speed in the ring
         let maxAccelPS: CGFloat  = 2200.0  // max outward speed change per second
         let tinyBias: CGFloat    = 60.0    // small outward bias when blocking entry
         let ghTol: CGFloat       = 10.0    // only treat as “bottom” when ground is ~flat (near 0)
@@ -929,30 +925,30 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         let maxDelta = maxAccelPS * dtClamp
         
         // Inside the thin bottom ring → push outward
-        if b.r >= innerBand && b.r <= outerBand {
-            let need = max(0, minOutward - vRad)
-            if need > 0 {
-                let add = min(maxDelta, need)
-                pb.velocity = CGVector(dx: v.dx + nx * add, dy: v.dy + ny * add)
-                // tiny positional nudge to avoid re-hitting the exact boundary next frame
-                car.position = CGPoint(x: car.position.x + nx * 0.5, y: car.position.y + ny * 0.5)
-            }
+        // GameScene.swift — inside applyHillBottomOneWayGuard(dt:)
+        if b.r > outerBand && b.r < blockOuter, vRad < 0 {
+            // reflect radial component with a little restitution
+            let e: CGFloat = 0.30              // bounce "springiness"
+            let vtX = v.dx - nx * vRad         // tangential part
+            let vtY = v.dy - ny * vRad
+            let newRad = e * (-vRad) + tinyBias
+            
+            var out = CGVector(
+                dx: nx * newRad + vtX * 0.95,  // slight tangential damping
+                dy: ny * newRad + vtY * 0.95
+            )
+            // cap per-step change
+            let dvx = CGFloat.clamp(out.dx - v.dx, -maxDelta, maxDelta)
+            let dvy = CGFloat.clamp(out.dy - v.dy, -maxDelta, maxDelta)
+            out = CGVector(dx: v.dx + dvx, dy: v.dy + dvy)
+            pb.velocity = out
+            
+            // tiny nudge + feedback
+            car.position = CGPoint(x: car.position.x + nx * 0.5, y: car.position.y + ny * 0.5)
+            car.playHitFX(at: car.position)
             return
         }
-        
-        // Just outside the ring → do not allow entry (strip inward component, add tiny outward bias)
-        if b.r > outerBand && b.r < blockOuter, vRad < 0 {
-            var out = v
-            // remove inward (negative) radial component
-            out.dx -= nx * vRad
-            out.dy -= ny * vRad
-            // tiny outward bias so we don’t sit on the fence
-            out.dx += nx * tinyBias
-            out.dy += ny * tinyBias
-            pb.velocity = out
-        }
     }
-    
     
     private func updateSpeedHUD(kmh: CGFloat) {
         let now = CACurrentMediaTime()
@@ -1051,12 +1047,11 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
             if fireTouch == nil, pointInsideFireButton(pCam) {
                 fireTouch = t
                 car.startAutoFire(on: self)
-                setFiring(true)                 // ← color ON
                 animateFireTap()
-                setFireControl(active: true)
+                setFiring(true)
                 continue
             } else {
-                setFireControl(active: false)
+                setFiring(false)
             }
             
             // NEW: Drive button press → center ring on the button
@@ -1075,10 +1070,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
                 ringHandle.position = .zero
                 animateDriveTap()
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                setMoveControl(active: true)
                 continue
-            } else {
-                setMoveControl(active: false)
             }
             
             if driveTouch == nil {
@@ -1098,16 +1090,12 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
                     showRing()
                     ringHandle.position = .zero
                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    refreshControlActiveFlags()
                 }
             }
         }
         
-        for t in touches {
-            let p = t.location(in: self)
-            
-            if fireButton.contains(p) { setMoveControl(active: true) }
-            if driveButton.contains(p) { setFireControl(active: true) }
-        }
+        refreshControlActiveFlags()
     }
     
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -1144,11 +1132,13 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
         for t in touches {
             if let ft = fireTouch, t === ft {
                 fireTouch = nil
+                refreshControlActiveFlags()
                 car.stopAutoFire()
                 setFiring(false)         // ← color OFF
             }
             if let dt = driveTouch, t === dt {
                 driveTouch = nil
+                refreshControlActiveFlags()
                 isTouching = false
                 controlArmed = false
                 fingerCam = nil
@@ -1160,8 +1150,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate {
             }
         }
         
-        setMoveControl(active: false)
-        setFireControl(active: false)
+        refreshControlActiveFlags()
     }
     
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -2404,6 +2393,84 @@ extension GameScene {
             b.node?.removeAllActions()
             b.node?.removeFromParent()
         }
+        
+        func isCat(_ body: SKPhysicsBody, _ cat: UInt32) -> Bool {
+            (body.categoryBitMask & cat) != 0
+        }
+
+        // --- Bullet ↔︎ Car ---
+        if isCat(a, Category.bullet), let bullet = a.node,
+           let car = b.node as? CarNode {
+            if let owner = bullet.userData?["owner"] as? CarNode, owner === car { return }
+            let dmg = (a.node as? BulletNode)?.damage ?? 1
+            car.receiveProjectile(damage: dmg, at: contact.contactPoint)
+            bullet.removeFromParent()
+            return
+        }
+        if isCat(b, Category.bullet), let bullet = b.node,
+           let car = a.node as? CarNode {
+            if let owner = bullet.userData?["owner"] as? CarNode, owner === car { return }
+            let dmg = (b.node as? BulletNode)?.damage ?? 1
+            car.receiveProjectile(damage: dmg, at: contact.contactPoint)
+            bullet.removeFromParent()
+            return
+        }
+
+        // --- Car ↔︎ Wall/Obstacle ---
+        if isCat(a, Category.car), (b.categoryBitMask & (Category.wall | Category.obstacle)) != 0,
+           let car = a.node as? CarNode {
+            car.handleCrash(contact: contact, other: b)
+            _hadSolidContactThisStep = true
+            return
+        }
+        if isCat(b, Category.car), (a.categoryBitMask & (Category.wall | Category.obstacle)) != 0,
+           let car = b.node as? CarNode {
+            car.handleCrash(contact: contact, other: a)
+            _hadSolidContactThisStep = true
+            return
+        }
+
+        // --- Car ↔︎ Car ---
+        if isCat(a, Category.car), isCat(b, Category.car),
+           let ca = a.node as? CarNode, let cb = b.node as? CarNode {
+
+            // Cheap impact estimate from relative velocity
+            let dvx = a.velocity.dx - b.velocity.dx
+            let dvy = a.velocity.dy - b.velocity.dy
+            let rel = hypot(dvx, dvy)                // points/sec
+            let dmg = max(6, min(40, Int(rel * 0.02))) // tune: ~0–40
+
+            ca.handleCrash(contact: contact, other: b, damage: dmg)
+            cb.handleCrash(contact: contact, other: a, damage: dmg)
+            _hadSolidContactThisStep = true
+            return
+        }
+        
+        // A) Bullet ↔ Car  → apply projectile damage, then kill the bullet
+        if (isBullet(a) && isCar(b)) || (isBullet(b) && isCar(a)) {
+            let bullet   = isBullet(a) ? a : b
+            let carBody  = isCar(a)    ? a : b
+            if let target = carBody.node as? CarNode {
+                // Optional friendly-fire guard: if you tag bullets with userData["owner"] = CarNode
+                if let shooter = bullet.node?.userData?["owner"] as? CarNode, shooter === target {
+                    killBullet(bullet)   // ignore self-hit
+                    return
+                }
+                let dmg = (bullet.node as? BulletNode)?.damage ?? 10
+                target.receiveProjectile(damage: dmg, at: contact.contactPoint)  // <<< add method below
+            }
+            killBullet(bullet)
+            return
+        }
+
+        // B) Car ↔ Car  → both take “crash” damage
+        if isCar(a) && isCar(b) {
+            // Reuse your existing crash handler on both sides
+            (a.node as? CarNode)?.handleCrash(contact: contact, other: b)
+            (b.node as? CarNode)?.handleCrash(contact: contact, other: a)
+            return
+        }
+
         
         // Mark that we touched something solid this step (used by the contact-boost clamp)
         if (isCar(a) && (isObstacle(b) || isWall(b) || isRamp(b))) ||
