@@ -2,3 +2,8 @@ DerivedData/
 *.xcuserstate
 *.xcuserdata/
 
+# Python virtual envs
+venv/
+.venv/
+env/
+ENV/

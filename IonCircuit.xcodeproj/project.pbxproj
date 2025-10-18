@@ -10,9 +10,22 @@
 		4F350CC22E9BAEA80008DA0E /* IonCircuit.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = IonCircuit.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		4F0B1C072EA2FE5E00042E5B /* Exceptions for "IonCircuit" folder in "IonCircuit" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Core/Untitled.swift,
+			);
+			target = 4F350CC12E9BAEA80008DA0E /* IonCircuit */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		4F350CC42E9BAEA80008DA0E /* IonCircuit */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				4F0B1C072EA2FE5E00042E5B /* Exceptions for "IonCircuit" folder in "IonCircuit" target */,
+			);
 			path = IonCircuit;
 			sourceTree = "<group>";
 		};
