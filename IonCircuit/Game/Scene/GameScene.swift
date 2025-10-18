@@ -2216,11 +2216,9 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         }
         
         guard dt > 0 else {
-            camera?.position = car.position
+            recenterCameraOnTargetIfNeeded()
             return
         }
-        
-        camera?.position = car.position
         
         maybeUpdateObstacleStreaming(currentTime)
         
