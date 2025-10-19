@@ -1813,6 +1813,7 @@ final class RLServer {
             // penalties
             let deathPenalty  = agent.isDead ? -3.0 : 0.0
             let reversePenalty = -agent.consumeReversePenalty()
+            let isWinRound = target.isDead || target.livesLeft == 0 ? 30.0 : 0.0
             
             reward = 0.001
             + speedTerm
@@ -1820,6 +1821,7 @@ final class RLServer {
             + killBonus
             + deathPenalty
             + reversePenalty
+            + isWinRound
             
             done = agent.isDead || stepCount >= maxSteps
             // -------------------------------------------------------------------------
@@ -1876,16 +1878,18 @@ extension CarNode {
             ] as CFArray
             let locs: [CGFloat] = [0.0, 0.25, 0.70, 1.0]
             let grad = CGGradient(colorsSpace: space, colors: colors, locations: locs)!
-            
-            // Stretch vertically → elliptical plume
+
+            // Shift the bright core toward the TOP of the sprite so it sits right on the emitter.
+            // (keeps particles drawn inside the tail instead of starting with a visible gap)
+            let coreY = h * 0.34
             cg.saveGState()
-            cg.translateBy(x: w/2, y: h/2)
-            cg.scaleBy(x: 1.0, y: 1.8)
-            cg.translateBy(x: -w/2, y: -h/2)
+            cg.translateBy(x: w/2, y: coreY)
+            cg.scaleBy(x: 1.0, y: 2.0) // slightly more elongated vertically
+            cg.translateBy(x: -w/2, y: -coreY)
             cg.drawRadialGradient(
                 grad,
-                startCenter: CGPoint(x: w/2, y: h/2), startRadius: 0,
-                endCenter:   CGPoint(x: w/2, y: h/2), endRadius:  w/2,
+                startCenter: CGPoint(x: w/2, y: coreY), startRadius: 0,
+                endCenter:   CGPoint(x: w/2, y: coreY), endRadius:  w/2,
                 options: .drawsBeforeStartLocation
             )
             cg.restoreGState()
@@ -1894,65 +1898,65 @@ extension CarNode {
         tex.filteringMode = .linear
         return tex
     }
-    
+
     static func makeIonExhaustEmitter(texture: SKTexture) -> SKEmitterNode {
         let e = SKEmitterNode()
         e.particleTexture = texture
         e.particleBlendMode = .add
-        
-        // base ion feel — long, narrow, glowy
+
+        // Tighter, starts right at the emitter, and fades a bit slower near the origin.
         e.particleBirthRate = 0
-        e.particleLifetime = 0.46
-        e.particleLifetimeRange = 0.12
-        e.particleSpeed = 220
-        e.particleSpeedRange = 120
-        e.particlePositionRange = CGVector(dx: 1.5, dy: 0)
-        e.particleAlpha = 0.90
-        e.particleAlphaSpeed = -1.4
+        e.particleLifetime = 0.42
+        e.particleLifetimeRange = 0.10
+        e.particleSpeed = 180              // was 220
+        e.particleSpeedRange = 80          // was 120
+        e.particlePositionRange = CGVector(dx: 1.0, dy: 0)
+        e.particleAlpha = 1.0
+        e.particleAlphaSpeed = -1.0        // was -1.4 (keeps origin visible)
         e.particleScale = 0.12
-        e.particleScaleRange = 0.06
+        e.particleScaleRange = 0.05
         e.particleScaleSpeed = 0.10
         e.particleRotation = 0
         e.particleRotationSpeed = 0
         e.emissionAngle = -CGFloat.pi/2
-        e.emissionAngleRange = CGFloat.pi/36   // tighter = more “beam-like”
+        e.emissionAngleRange = CGFloat.pi/72  // was pi/36 (tighter beam)
         e.xAcceleration = 0
-        e.yAcceleration = -20                  // subtle pull for a tapered tail
+        e.yAcceleration = -10                 // was -20 (less pull-away)
         e.zPosition = 1.5
         return e
     }
-    
+
     // Ion tuning (cooler, longer, responsive to throttle)
     func updateExhaust(speed: CGFloat, fwdMag: CGFloat, dt: CGFloat) {
         let moving = speed > 2.0 || throttle > 0.02
         let speedNorm = CGFloat.clamp(speed / max(maxSpeed, 1), 0, 1)
         let throttleBoost = max(0, throttle)
         let targetMix: CGFloat = moving ? (0.35 * speedNorm + 0.65 * throttleBoost) : 0.0
-        
+
         let a = 1 - exp(-Double(dt / max(exhaustFadeTau, 0.001)))
         exhaustMixLP += (targetMix - exhaustMixLP) * CGFloat(a)
         let mix = CGFloat.clamp(exhaustMixLP, 0, 1)
-        
-        // --- ion plume tuning (longer, cooler, glowy) ---
+
+        // Keep overall length similar but ensure the plume hugs the tail at the origin.
         let maxBR: CGFloat = 400
         let br = maxBR * mix
-        
-        let basePS: CGFloat = 160
-        let addPS:  CGFloat = 240
+
+        let basePS: CGFloat = 150            // was 160
+        let addPS:  CGFloat = 210            // was 240
         let ps = basePS + addPS * mix
-        
-        let scale = 0.10 + 0.16 * mix
-        let baseLT: CGFloat = 0.42
-        let addLT:  CGFloat = 0.26
+
+        let scale = 0.10 + 0.14 * mix        // slightly narrower
+        let baseLT: CGFloat = 0.44           // a touch longer to compensate for lower speed
+        let addLT:  CGFloat = 0.24
         let lt = baseLT + addLT * (mix * 0.35)
         let ltRange = lt * 0.18
-        let alphaSpeed = -0.9 - 0.5 * (1 - mix) // slower fade at high power
-        
+        let alphaSpeed = -0.8 - 0.4 * (1 - mix) // slower fade near origin
+
         [exhaustL, exhaustR].forEach { e in
             e.particleBirthRate = br
             e.particleSpeed = ps
             e.particleScale = scale
-            e.particleAlpha = 0.80 + 0.15 * mix
+            e.particleAlpha = 0.85 + 0.10 * mix
             e.particleLifetime = lt
             e.particleLifetimeRange = ltRange
             e.particleAlphaSpeed = alphaSpeed

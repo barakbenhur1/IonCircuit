@@ -32,6 +32,9 @@ final class ObstacleNode: SKNode {
     private var damageBarFG: SKShapeNode?
     private var badgeNode: SKNode? // for steel's “shield” badge
     
+    private weak var visualBase: SKShapeNode?
+    private var visualBaseColor: UIColor = .clear
+    
     init(kind: ObstacleKind) {
         self.kind = kind
         if ObstacleNode.isDestructible(kind) {
@@ -72,6 +75,8 @@ final class ObstacleNode: SKNode {
             shape.strokeColor = .init(white: 1, alpha: 0.12)
             shape.lineWidth = 1.5
             addChild(shape)
+            visualBase = shape
+            visualBaseColor = shape.fillColor
             let pb = SKPhysicsBody(circleOfRadius: r)
             configure(body: pb)
             barYOffset = r + 18
@@ -93,6 +98,8 @@ final class ObstacleNode: SKNode {
             rings.lineWidth = 2
             body.addChild(rings)
             addChild(body)
+            visualBase = body
+            visualBaseColor = body.fillColor
             let pb = SKPhysicsBody(rectangleOf: CGSize(width: w, height: h))
             configure(body: pb)
             barYOffset = h/2 + 16
@@ -108,6 +115,8 @@ final class ObstacleNode: SKNode {
             shape.strokeColor = .white.withAlphaComponent(0.20)
             shape.lineWidth = 1.0
             addChild(shape)
+            visualBase = shape
+            visualBaseColor = shape.fillColor
             let pb = SKPhysicsBody(rectangleOf: CGSize(width: 22, height: 30))
             configure(body: pb)
             barYOffset = 26
@@ -131,6 +140,8 @@ final class ObstacleNode: SKNode {
             stripes.lineWidth = 3
             shape.addChild(stripes)
             addChild(shape)
+            visualBase = shape
+            visualBaseColor = shape.fillColor
             let pb = SKPhysicsBody(rectangleOf: CGSize(width: w, height: h))
             configure(body: pb)
             barYOffset = h/2 + 16
@@ -310,15 +321,21 @@ final class ObstacleNode: SKNode {
     }
     
     private func flashTint() {
-        guard let base = (children.first as? SKShapeNode) else { return }
-        let orig = base.fillColor
+        guard let base = visualBase else { return }
+        let orig = visualBaseColor
+
+        // If a previous flash is mid-flight, cancel and reset first
         base.removeAction(forKey: "flash")
-        let flash = SKAction.sequence([
-            .customAction(withDuration: 0.0) { _,_ in base.fillColor = .red.withAlphaComponent(0.85) },
-            .wait(forDuration: 0.06),
-            .customAction(withDuration: 0.0) { _,_ in base.fillColor = orig }
-        ])
-        base.run(flash, withKey: "flash")
+        base.fillColor = orig
+
+        let toRed = SKAction.customAction(withDuration: 0.0) { _,_ in
+            base.fillColor = .red.withAlphaComponent(0.85)
+        }
+        let wait  = SKAction.wait(forDuration: 0.06)
+        let back  = SKAction.customAction(withDuration: 0.0) { _,_ in
+            base.fillColor = orig
+        }
+        base.run(.sequence([toRed, wait, back]), withKey: "flash")
     }
     
     private func ricochetFX(at p: CGPoint?) {

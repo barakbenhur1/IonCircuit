@@ -186,15 +186,21 @@ final class HillNode: SKNode {
 
     // MARK: - Physics
     private func buildPhysics() {
-        // A thin edge loop around the outer rim acts as a "wall".
-        // Cars cannot drive up unless they jump over it.
+        // Thin edge loop around the outer rim (still blocks bullets/obstacles)
         let pb = SKPhysicsBody(edgeLoopFrom: rimPath)
         pb.isDynamic = false
         pb.friction = 0.8
         pb.restitution = 0.05
+
+        // Keep whatever category you use for static geometry. Category.wall is fine.
         pb.categoryBitMask = Category.wall
-        pb.collisionBitMask = Category.car | Category.obstacle | Category.bullet
-        pb.contactTestBitMask = 0
+
+        // ❗ One-way: DO NOT collide with cars
+        pb.collisionBitMask = Category.obstacle | Category.bullet | Category.car  // ← removed Category.car
+
+        // Still let bullets register hits on the hill so they pop on impact
+        pb.contactTestBitMask = Category.bullet
+
         self.physicsBody = pb
     }
     
@@ -281,5 +287,30 @@ final class HillNode: SKNode {
         let t = SKTexture(image: img)
         t.filteringMode = .linear
         return t
+    }
+}
+
+extension SKScene {
+    /// True if `p` is within any HillNode's top (inner ellipse).
+    func isInsideAnyHill(_ p: CGPoint) -> Bool {
+        var inside = false
+        enumerateChildNodes(withName: "hill") { node, stop in
+            if let hill = node as? HillNode, hill.containsTop(p, in: self) {
+                inside = true
+                stop.pointee = true
+            }
+        }
+        return inside
+    }
+}
+
+extension SKPhysicsBody {
+    /// Enable/disable collision against Category.wall without touching other bits.
+    func enableWallCollision(_ on: Bool) {
+        if on {
+            collisionBitMask |= Category.wall
+        } else {
+            collisionBitMask &= ~Category.wall
+        }
     }
 }

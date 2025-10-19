@@ -141,6 +141,13 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
     private var rlRampsTakenThisTick    = 0        // counted in didBegin ramp contacts (with cooldown)
     private var rlNextRampRewardTime    = 0.0      // CACurrentMediaTime() cooldown gate
     
+    // === RL: run BOTH cars with real training ==========================
+    private var rlControlsPlayer = false      // the .player car is driven by RL
+    private var aiControlsPlayer = false
+    private var rlControlsEnemy  = true      // enemies driven by RL (first enemy)
+    private var playerRLServer: RLServer?
+    private var enemyRLServer:  RLServer?
+    
     // World bounds
     private var worldBounds: CGRect = .zero
     // ==== Spawn only in the map BORDER band ====
@@ -232,6 +239,21 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
     private let hillsBorderOnly: Bool = false
     private let rampsBorderOnly: Bool = false
     
+    // === Ion Void FX (outside world) =============================================
+    private let voidFXRoot = SKNode()
+    private var voidSprite: SKSpriteNode?
+    private var voidTime: Float = 0
+    
+    private var rlServerEnemy: RLServer?   // replaces old rlServer
+    private var rlServerPlayer: RLServer?
+
+    // Keep a handle to the time uniform so we can update it every frame
+    private var voidTimeUniform = SKUniform(name: "u_time", float: 0)
+    
+    private var playerIsAIControlled: Bool { aiControlsPlayer || rlControlsPlayer }
+    
+    private let aiAutoRestartDelay: TimeInterval = 0.5
+    
     // --- Training state ---
     var rlPrevHP: Int = 0
     var rlEpisodeStep: Int = 0
@@ -264,6 +286,53 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         headingHUD.isPaused = true
         rampPointer.isPaused = true
         enhancementHUD.isPaused = true
+    }
+    
+    private func buildIonVoidFX() {
+        guard worldBounds.width > 0 && worldBounds.height > 0 else { return }
+        
+        voidFXRoot.removeAllChildren()
+
+        if voidFXRoot.parent == nil {
+            voidFXRoot.zPosition = -50        // below gameplay, above any map background
+            addChild(voidFXRoot)
+        }
+
+        // Massive cover so it always reaches the screen edges
+        let coverSide: CGFloat = 100_000
+        let sprite = SKSpriteNode(color: .systemTeal.withAlphaComponent(0.4), size: .init(width: coverSide, height: coverSide))
+        sprite.position = CGPoint(x: worldBounds.midX, y: worldBounds.midY)
+        sprite.anchorPoint = .init(x: 0.5, y: 0.5)
+
+        // Use normal alpha blending (REPLACE can leave holes on iOS if anything clears behind)
+        sprite.blendMode = .alpha
+        sprite.alpha = 1.0
+        sprite.zPosition = -50
+        voidFXRoot.addChild(sprite)
+        voidSprite = sprite
+
+        // Optional neon outline at the edge of the world
+        let outline = SKShapeNode(rect: worldBounds)
+        outline.strokeColor = UIColor.systemTeal.withAlphaComponent(0.40)
+        outline.glowWidth = 18
+        outline.lineWidth = 2
+        outline.fillColor = .clear
+        outline.zPosition = -49
+        voidFXRoot.addChild(outline)
+    }
+    
+    private func scheduleAutoRestartIfAIControlled(delay: TimeInterval = 1.2) {
+        // Only auto-restart when the player is AI-driven
+        guard aiControlsPlayer || rlControlsPlayer else { return }
+        // Avoid multiple queued restarts
+        removeAction(forKey: "autoRestart")
+        let restart = SKAction.run { [weak self] in
+            guard let self = self else { return }
+            self.gameOverOverlay.hide()
+            self.winOverlay.hide()
+            self.restartRound()
+        }
+        run(.sequence([.wait(forDuration: delay), restart]), withKey: "autoRestart")
     }
     
     private func resumeWorldAfterRespawn() {      // NEW
@@ -348,6 +417,43 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         return c
     }
     
+    private func bindRLServers() {
+        // Clean any old servers (e.g., after restartRound)
+        playerRLServer?.stop()
+        enemyRLServer?.stop()
+        playerRLServer = nil
+        enemyRLServer  = nil
+
+        // Find an enemy to duel
+        guard let enemy = cars.first(where: { $0.kind == .enemy && !$0.isDead }) else { return }
+
+        // Enemy agent trains vs the player
+        if rlControlsPlayer {
+            do {
+                let srv = try RLServer(scene: self, agent: car, target: agent, port: 5555)
+                enemyRLServer = srv
+                srv.start()
+                print("✅ RLServer (Player) listening on 5555")
+            } catch { print("Player RLServer failed:", error) }
+        } else {
+            do { try enemy.useLearnedPolicyFromBundle(named: "IonCircuitPolicy") }
+            catch { print("Player load policy failed:", error) }
+        }
+
+        // Player agent trains vs that enemy (keeps Kind.player so HUD/UX remain)
+        if rlControlsEnemy {
+            do {
+                let srv = try RLServer(scene: self, agent: agent, target: car, port: 5556)
+                playerRLServer = srv
+                srv.start()
+                print("✅ RLServer (Enemy) listening on 5556")
+            } catch { print("Enemy RLServer failed:", error) }
+        } else {
+            // If you ever want human control back, set rlControlsPlayer = false
+            // and skip binding a player server.
+        }
+    }
+    
     // MARK: - Scene lifecycle
     override func didMove(to view: SKView) {
         backgroundColor = .black
@@ -355,7 +461,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         view.isMultipleTouchEnabled = true
         
         // World
-        let scalar: CGFloat = 40.0
+        let scalar: CGFloat = 15.0 // map size //
         let worldSize = CGSize(width: size.width * scalar, height: size.height * scalar)
         let world = OpenWorldNode(config: .init(size: worldSize))
         addChild(world)
@@ -365,6 +471,8 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
                              y: -worldSize.height * 0.5,
                              width: worldSize.width,
                              height: worldSize.height)
+        
+        buildIonVoidFX()
         
         // Car
         let searchRect = frame.insetBy(dx: 160, dy: 160)
@@ -487,43 +595,25 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         self.rlPrevAgentBulletCount = bulletCount(for: agent)  // initialize baseline
         
         cameraTarget = agent
-        followedEnemyIndex = 0
+        
+        rlControlsEnemy = true
+        rlControlsPlayer = true
+        setAIControlsPlayer(aiControlsPlayer, training: true)
+        
+        followPlayer()
         updateCameraFollow(dt: 0)
-        
-        let train = true
-        
-        if train {
-            do {
-                rlServer = try RLServer(scene: self, agent: agent, target: target, port: 5555)
-                rlServer?.start()
-            } catch {
-                print("RLServer failed:", error)
-            }
-        } else {
-            do {
-                try agent.useLearnedPolicyFromBundle(named: "IonCircuitPolicy")
-            } catch {
-                print("Failed to load policy: \(error). Falling back to built-in enemy AI.")
-            }
-        }
     }
     
     // MARK: - Camera follow API
     
     private func updateCameraFollow(dt: CGFloat) {
         guard let cam = camera else { return }
-        let enemies = cars.filter({ $0.kind == .enemy })
         let targetNode = cameraTarget ?? car
         let dest = targetNode.position
         let pos = cam.position
         let t = cameraFollowLerp
         cam.position = CGPoint(x: pos.x + (dest.x - pos.x) * t,
                                y: pos.y + (dest.y - pos.y) * t)
-        
-        // If we were following an enemy that got removed, fall back to player
-        if let i = followedEnemyIndex, !enemies.indices.contains(i) {
-            followPlayer()
-        }
     }
 
     func followPlayer() {
@@ -597,7 +687,125 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         return cos(err)
     }
     
+    // MARK: - AI obstacle awareness & tactical fire
+
+    private var aiBurstLockout: [ObjectIdentifier: TimeInterval] = [:]
+
+    @inline(__always)
+    private func isDestructibleObstacleNode(_ n: SKNode) -> Bool {
+        // Treat any obstacle that isn't explicitly marked non-destructible or "steel" as fair game
+        if let d = n.userData?["destructible"] as? Bool, d == false { return false }
+        if let name = n.name?.lowercased(), name.contains("steel") { return false }
+        return true
+    }
+
+    private func lineOfSightOrBlocker(from a: CarNode, to b: CarNode)
+    -> (los: Bool, blocker: SKNode?) {
+        let start = a.position, end = b.position
+        var los = false
+        var blocker: SKNode?
+        physicsWorld.enumerateBodies(alongRayStart: start, end: end) { body, _, _, stop in
+            guard let n = body.node else { return }
+            // If first hit is the target (or inside it), we have LoS
+            if n === b || n.inParentHierarchy(b) {
+                los = true; stop.pointee = true; return
+            }
+            // If we hit anything solid before the target, that is the blocker
+            if (body.categoryBitMask & (Category.wall | Category.obstacle | Category.hole | Category.ramp)) != 0 || n is HillNode {
+                blocker = n; stop.pointee = true; return
+            }
+        }
+        return (los, blocker)
+    }
+
+    private func firstObstacleAheadInCone(for shooter: CarNode,
+                                          maxDist: CGFloat = 520,
+                                          halfAngle: CGFloat = .pi/8) -> SKNode? {
+        let origin = shooter.position
+        let heading = shooter.zRotation + .pi/2
+        let dir = CGVector(dx: cos(heading), dy: sin(heading))
+
+        var closest: (n: SKNode, d: CGFloat)? = nil
+
+        // Use a coarse sweep: a few rays in the cone + a small AABB probe
+        let rays = [-halfAngle * 0.6, 0, halfAngle * 0.6]
+        for off in rays {
+            let a = heading + off
+            let end = CGPoint(x: origin.x + cos(a) * maxDist, y: origin.y + sin(a) * maxDist)
+            physicsWorld.enumerateBodies(alongRayStart: origin, end: end) { [weak self] body, p, _, stop in
+                guard let n = body.node else { return }
+                if (body.categoryBitMask & Category.obstacle) != 0, self?.isDestructibleObstacleNode(n) == true {
+                    let d = hypot(p.x - origin.x, p.y - origin.y)
+                    if closest == nil || d < closest!.d { closest = (n, d) }
+                    stop.pointee = true
+                    return
+                }
+                if (body.categoryBitMask & (Category.wall | Category.ramp | Category.hole)) != 0 {
+                    stop.pointee = true
+                    return
+                }
+            }
+        }
+
+        // Extra: local box in front (helps for very near obstacles)
+        let probeW: CGFloat = 90
+        let probeL: CGFloat = min(maxDist, 180)
+        let center = CGPoint(x: origin.x + dir.dx * (probeL * 0.5),
+                             y: origin.y + dir.dy * (probeL * 0.5))
+        let box = CGRect(x: center.x - probeW/2, y: center.y - probeW/2, width: probeW, height: probeL)
+        physicsWorld.enumerateBodies(in: box) { [weak self] body, _ in
+            guard let n = body.node else { return }
+            if (body.categoryBitMask & Category.obstacle) != 0, self?.isDestructibleObstacleNode(n) == true {
+                let d = shooter.position.distance(to: n.position)
+                if closest == nil || d < closest!.d { closest = (n, d) }
+            }
+        }
+
+        return closest?.n
+    }
+
+    private func fireBurst(_ car: CarNode, duration: TimeInterval = 0.18) {
+        // Start auto-fire briefly to clear geometry
+        car.startAutoFire(on: self)
+        car.run(.sequence([
+            .wait(forDuration: duration),
+            .run { [weak car] in car?.stopAutoFire() }
+        ]))
+    }
+
+    private func aiTacticalFireIfNeeded(shooter: CarNode, target: CarNode) {
+        let now = CACurrentMediaTime()
+        let key = ObjectIdentifier(shooter)
+        if let lock = aiBurstLockout[key], now < lock { return }
+
+        // (1) If LoS to target → standard aim/LoS rule (keeps your PvP behavior)
+        let (los, blocker) = lineOfSightOrBlocker(from: shooter, to: target)
+        if los {
+            if aimAlignment(from: shooter, to: target) > 0.85 {
+                // short controlled puff to avoid perma-firing
+                fireBurst(shooter, duration: 0.16)
+                aiBurstLockout[key] = now + 0.20
+            }
+            return
+        }
+
+        // (2) If LoS is blocked by a destructible obstacle → clear it
+        if let n = blocker, isDestructibleObstacleNode(n) {
+            fireBurst(shooter, duration: 0.22)
+            aiBurstLockout[key] = now + 0.28
+            return
+        }
+
+        // (3) No target LoS: proactively clear obstacle straight ahead (path opening)
+        if let _ = firstObstacleAheadInCone(for: shooter, maxDist: 520, halfAngle: .pi/10) {
+            fireBurst(shooter, duration: 0.18)
+            aiBurstLockout[key] = now + 0.24
+            return
+        }
+    }
+    
     private func restartRound() {
+        removeAction(forKey: "autoRestart")
         // Hide overlays if still up
         gameOverOverlay.hide()
         winOverlay.hide()
@@ -623,6 +831,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
             _ = spawnEnemy(at: p)
         }
         
+        setAIControlsPlayer(aiControlsPlayer, training: true)
         cameraFrozenPos = nil
         resumeWorldAfterRespawn()
     }
@@ -651,6 +860,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
     
     override func didChangeSize(_ oldSize: CGSize) {
         super.didChangeSize(oldSize)
+        buildIonVoidFX()
         placeHUD()
         placeFireButton()
         placeDriveButton()
@@ -694,8 +904,10 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
     }
     
     override func willMove(from view: SKView) {
-        if let g = pinchGR { view.removeGestureRecognizer(g) }
         super.willMove(from: view)
+        enemyRLServer?.stop(); enemyRLServer = nil
+        playerRLServer?.stop(); playerRLServer = nil
+        if let g = pinchGR { view.removeGestureRecognizer(g) }
     }
     
     // MARK: - Speed ring
@@ -1103,6 +1315,13 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
 
     // Keep the camera lock AFTER physics each frame so it never lags
     override func didSimulatePhysics() {
+        super.didSimulatePhysics()
+        if let cam = camera, let s = voidSprite {
+            s.position = cam.position
+            if let u = s.shader?.uniformNamed("u_center") {
+                u.vectorFloat2Value = .init(Float(s.position.x), Float(s.position.y))
+            }
+        }
         // If we're freezing on death, don't re-center until respawn
         guard cameraFrozenPos == nil else { return }
         defer { _hadSolidContactThisStep = false }
@@ -1278,12 +1497,14 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
     
     func carNodeDidRunOutOfLives(_ car: CarNode) {
         guard let cam = camera else { return }
-        
+       
         if car.kind == .player {
-            // Player lost → freeze and show Game Over
             cameraFrozenPos = self.car.position
             pauseWorldForDeath()
             gameOverOverlay.show(in: cam, size: size)
+
+            // NEW: auto restart if AI drives the player
+            scheduleAutoRestartIfAIControlled(delay: aiAutoRestartDelay)
             return
         }
         
@@ -1297,10 +1518,74 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         }
         let anyEnemyStillAlive = cars.contains { $0.kind == .enemy && $0.livesLeft > 0 }
         if !anyEnemyStillAlive {
-            // Pause now (we didn’t pause on enemy explode)
             cameraFrozenPos = self.car.position
             pauseWorldForDeath()
             winOverlay.show(in: cam, size: size)
+
+            // NEW: auto restart if AI drives the player
+            scheduleAutoRestartIfAIControlled(delay: aiAutoRestartDelay)
+        }
+    }
+    
+    // Stop any RL servers we spun up
+    private func stopRLServers() {
+        playerRLServer?.stop()
+        enemyRLServer?.stop()
+        playerRLServer = nil
+        enemyRLServer  = nil
+    }
+
+    // Start/refresh BOTH sides to use the SAME path
+    // - train == true  → live RL via RLServer on two ports
+    // - train == false → both sides load the same learned policy
+    private func bindRLServers(train: Bool = true, policyName: String = "IonCircuitPolicy") {
+        stopRLServers()
+        
+        // We need a live enemy to target. Pick the first alive enemy.
+        guard let enemy = cars.first(where: { $0.kind == .enemy && !$0.isDead }) else { return }
+        
+        // Enemy: RL or inference vs the player
+        if aiControlsPlayer {
+            if train {
+                do {
+                    let srv = try RLServer(scene: self, agent: car, target: enemy, port: 5555)
+                    enemyRLServer = srv
+                    srv.start()
+                    print("✅ RLServer (Player) listening on 5555")
+                } catch { print("Player RLServer failed:", error) }
+            } else {
+                do { try enemy.useLearnedPolicyFromBundle(named: policyName) }
+                catch { print("Player policy load failed:", error) }
+            }
+        }
+        
+        // Player: mirror the *same* AI path (RL or the same policy file)
+        if rlControlsEnemy {
+            if train {
+                do {
+                    let srv = try RLServer(scene: self, agent: enemy, target: car, port: 5556)
+                    playerRLServer = srv
+                    srv.start()
+                    print("✅ RLServer (Enemy) listening on 5556")
+                } catch { print("Enemy RLServer failed:", error) }
+            } else {
+                do { try car.useLearnedPolicyFromBundle(named: policyName) }
+                catch { print("Enemy policy load failed:", error) }
+            }
+        }
+    }
+
+    // Toggle AI control of the PLAYER (keeps Kind.player for HUD/UX)
+    func setAIControlsPlayer(_ enabled: Bool, training: Bool = true, policyName: String = "IonCircuitPolicy") {
+        aiControlsPlayer  = enabled         // your touch handlers already guard on this
+        rlControlsPlayer  = enabled         // keep your flags in sync
+        refreshControlActiveFlags()
+        
+        if enabled {
+            // (Re)bind after enemies exist so targets are valid
+            bindRLServers(train: training, policyName: policyName)
+        } else {
+            stopRLServers()                 // return to human control
         }
     }
     
@@ -1312,6 +1597,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
     
     // MARK: - Touches
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if controlsLockedForOverlay || pausedForDeath || aiControlsPlayer { return }
         guard let t = touches.first else { return }
         // If overlay is visible, let it consume the touch first
         if !gameOverOverlay.isHidden, gameOverOverlay.handleTouch(scenePoint: t.location(in: self)) { return }
@@ -1378,6 +1664,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
     }
     
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if controlsLockedForOverlay || pausedForDeath || aiControlsPlayer { return }
         if controlsLockedForOverlay || pausedForDeath { return }   // NEW guard
         guard let cam = camera else { return }
         
@@ -1407,6 +1694,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
     }
     
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if controlsLockedForOverlay || pausedForDeath || aiControlsPlayer { return }
         if controlsLockedForOverlay || pausedForDeath { return }   // NEW guard
         for t in touches {
             if let ft = fireTouch, t === ft {
@@ -1433,6 +1721,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
     }
     
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if controlsLockedForOverlay || pausedForDeath || aiControlsPlayer { return }
         touchesEnded(touches, with: event)
     }
     
@@ -2197,8 +2486,12 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
     // MARK: - Update
     override func update(_ currentTime: TimeInterval) {
         let dt = lastUpdateTime > 0 ? CGFloat(currentTime - lastUpdateTime) : 0
-//        guard dt > 0 else { return }
         lastUpdateTime = currentTime
+        voidTime += max(0, Float(dt))
+        voidTimeUniform.floatValue = voidTime
+
+        buildIonVoidFX()
+        
         updateCameraFollow(dt: dt)
         stepEnhancementHUD(dt)
         
@@ -2216,6 +2509,8 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         }
         
         guard dt > 0 else {
+            voidTime += Float(dt)
+            voidTimeUniform.floatValue = voidTime
             recenterCameraOnTargetIfNeeded()
             return
         }
@@ -2308,7 +2603,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
             // Drive arrows highlight based on finger direction
             updateDriveArrows(fromInput: vFinger, tNorm: tNorm, activeBand: idx)
             
-        } else if isCoasting && !car.isDead {
+        } else if isCoasting && !car.isDead && !playerIsAIControlled {
             let speed = car.physicsBody?.velocity.length ?? 0
             if speed < 8 {
                 car.throttle = 0
@@ -2323,13 +2618,12 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
             car.speedCapBonus = 0
             // Dim arrows during coasting (no input)
             setDriveArrowColors(up: false, down: false, left: false, right: false, highlight: .systemTeal)
-        } else {
+        } else if !playerIsAIControlled {
             car.throttle = 0
             car.steer = 0
             hasAngleLP = false
             lockAngleUntilExitDeadzone = false
             car.speedCapBonus = 0
-            // No input → dim arrows
             setDriveArrowColors(up: false, down: false, left: false, right: false, highlight: .systemTeal)
         }
         
@@ -2339,6 +2633,31 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
             applyHillModifiers(for: car, gh: gh)
             car.stepVertical(dt: dt, groundHeight: gh)
             car.update(dt)
+        }
+        
+        // --- AI tactical fire control (obstacle-aware) ---
+        if let enemy = cars.first(where: { $0.kind == .enemy && !$0.isDead }) {
+            // If enemy is not driven by RL, use the heuristic fully.
+            if !rlControlsEnemy {
+                aiTacticalFireIfNeeded(shooter: enemy, target: car)
+            } else {
+                // Even during RL, auto-clear an immediate blocker straight ahead.
+                if let _ = firstObstacleAheadInCone(for: enemy, maxDist: 420, halfAngle: .pi/12) {
+                    fireBurst(enemy, duration: 0.14)
+                }
+            }
+        }
+
+        if aiControlsPlayer {
+            // If player is heuristic AI (not RL), clear path and shoot as needed.
+            if !rlControlsPlayer, let enemyForPlayer = cars.first(where: { $0.kind == .enemy && !$0.isDead }) {
+                aiTacticalFireIfNeeded(shooter: car, target: enemyForPlayer)
+            } else {
+                // RL player: still clear a near blocker to keep movement fluid
+                if let _ = firstObstacleAheadInCone(for: car, maxDist: 420, halfAngle: .pi/12) {
+                    fireBurst(car, duration: 0.14)
+                }
+            }
         }
         
         _preCarVel = car.physicsBody?.velocity ?? .zero   // ← NEW
@@ -2357,6 +2676,18 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         updateRampPointer()
         cullBulletsOutsideWorld()
         seedObstaclesFromEnemies()
+        
+        if let body = car.physicsBody {
+            body.enableWallCollision(!isInsideAnyHill(car.position))
+        }
+        
+        // Enemies (if you have an array like `enemies: [CarNode]`)
+        let enemies = cars.filter({ $0.kind == .enemy })
+        for e in enemies {
+            if let body = e.physicsBody {
+                body.enableWallCollision(!isInsideAnyHill(e.position))
+            }
+        }
     }
     
     // Which chunk does a point belong to?

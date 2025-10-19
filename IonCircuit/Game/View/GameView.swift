@@ -34,6 +34,7 @@ struct GameView: View {
     // Create with zero size; SpriteKit will resize it to the SpriteView bounds.
     @State private var scene: GameScene = {
         let s = GameScene(size: .zero)
+        s.backgroundColor = .black
         s.scaleMode = .resizeFill
         return s
     }()
@@ -42,12 +43,10 @@ struct GameView: View {
     
     var body: some View {
         ZStack {
-            SpriteView(
-                scene: scene,
-                preferredFramesPerSecond: preferredFPS,     // updated after screen is known
-                options: [.ignoresSiblingOrder],
-                debugOptions: [] // [.showsFPS, .showsNodeCount]
-            )
+            Color.black.ignoresSafeArea()          // <- backplate so any transparent pixels read as black
+            SpriteView(scene: scene,
+                       preferredFramesPerSecond: preferredFPS,
+                       options: [.ignoresSiblingOrder])
             .ignoresSafeArea()
             
             // Reads the correct UIScreen from the hosting window/scene.
