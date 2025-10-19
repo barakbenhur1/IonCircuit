@@ -49,6 +49,11 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
     private var lockAngleUntilExitDeadzone = false
     private var isCoasting = false
     
+    private var pendingChunkLoads: [(Int, Int)] = []
+    private var pendingChunkUnloads: [[SKNode]] = []
+    private let streamChunkLoadBudgetPerFrame = 1        // load <= N chunks per frame
+    private let streamNodeUnloadBudgetPerFrame = 120
+    
     // ==== Speed Ring HUD ====
     private let ringGroup = SKNode()
     private var ringBands: [SKShapeNode] = []
@@ -148,6 +153,9 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
     private var playerRLServer: RLServer?
     private var enemyRLServer:  RLServer?
     
+    private var nextRampPointerUpdate: TimeInterval = 0
+    private let rampPointerUpdateInterval: TimeInterval = 0.25
+    
     // World bounds
     private var worldBounds: CGRect = .zero
     // ==== Spawn only in the map BORDER band ====
@@ -246,7 +254,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
     
     private var rlServerEnemy: RLServer?   // replaces old rlServer
     private var rlServerPlayer: RLServer?
-
+    
     // Keep a handle to the time uniform so we can update it every frame
     private var voidTimeUniform = SKUniform(name: "u_time", float: 0)
     
@@ -292,25 +300,25 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         guard worldBounds.width > 0 && worldBounds.height > 0 else { return }
         
         voidFXRoot.removeAllChildren()
-
+        
         if voidFXRoot.parent == nil {
             voidFXRoot.zPosition = -50        // below gameplay, above any map background
             addChild(voidFXRoot)
         }
-
+        
         // Massive cover so it always reaches the screen edges
         let coverSide: CGFloat = 100_000
         let sprite = SKSpriteNode(color: .systemTeal.withAlphaComponent(0.4), size: .init(width: coverSide, height: coverSide))
         sprite.position = CGPoint(x: worldBounds.midX, y: worldBounds.midY)
         sprite.anchorPoint = .init(x: 0.5, y: 0.5)
-
+        
         // Use normal alpha blending (REPLACE can leave holes on iOS if anything clears behind)
         sprite.blendMode = .alpha
         sprite.alpha = 1.0
         sprite.zPosition = -50
         voidFXRoot.addChild(sprite)
         voidSprite = sprite
-
+        
         // Optional neon outline at the edge of the world
         let outline = SKShapeNode(rect: worldBounds)
         outline.strokeColor = UIColor.systemTeal.withAlphaComponent(0.40)
@@ -423,10 +431,10 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         enemyRLServer?.stop()
         playerRLServer = nil
         enemyRLServer  = nil
-
+        
         // Find an enemy to duel
         guard let enemy = cars.first(where: { $0.kind == .enemy && !$0.isDead }) else { return }
-
+        
         // Enemy agent trains vs the player
         if rlControlsPlayer {
             do {
@@ -439,7 +447,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
             do { try enemy.useLearnedPolicyFromBundle(named: "IonCircuitPolicy") }
             catch { print("Player load policy failed:", error) }
         }
-
+        
         // Player agent trains vs that enemy (keeps Kind.player so HUD/UX remain)
         if rlControlsEnemy {
             do {
@@ -615,19 +623,19 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         cam.position = CGPoint(x: pos.x + (dest.x - pos.x) * t,
                                y: pos.y + (dest.y - pos.y) * t)
     }
-
+    
     func followPlayer() {
         cameraTarget = car
         followedEnemyIndex = nil
     }
-
+    
     func followEnemy(at index: Int) {
         let enemies = cars.filter({ $0.kind == .enemy })
         guard enemies.indices.contains(index) else { return }
         cameraTarget = enemies[index]
         followedEnemyIndex = index
     }
-
+    
     // Convenience: cycle Player -> Enemy0 -> Enemy1 -> ... -> Player
     func cycleCameraTarget() {
         let enemies = cars.filter({ $0.kind == .enemy })
@@ -644,7 +652,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
             }
         }
     }
-
+    
     
     // Count bullets owned by a specific car. Bullets already carry userData["owner"] in your contacts code.
     private func bulletCount(for owner: CarNode) -> Int {
@@ -688,9 +696,9 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
     }
     
     // MARK: - AI obstacle awareness & tactical fire
-
+    
     private var aiBurstLockout: [ObjectIdentifier: TimeInterval] = [:]
-
+    
     @inline(__always)
     private func isDestructibleObstacleNode(_ n: SKNode) -> Bool {
         // Treat any obstacle that isn't explicitly marked non-destructible or "steel" as fair game
@@ -698,7 +706,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         if let name = n.name?.lowercased(), name.contains("steel") { return false }
         return true
     }
-
+    
     private func lineOfSightOrBlocker(from a: CarNode, to b: CarNode)
     -> (los: Bool, blocker: SKNode?) {
         let start = a.position, end = b.position
@@ -717,16 +725,16 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         }
         return (los, blocker)
     }
-
+    
     private func firstObstacleAheadInCone(for shooter: CarNode,
                                           maxDist: CGFloat = 520,
                                           halfAngle: CGFloat = .pi/8) -> SKNode? {
         let origin = shooter.position
         let heading = shooter.zRotation + .pi/2
         let dir = CGVector(dx: cos(heading), dy: sin(heading))
-
+        
         var closest: (n: SKNode, d: CGFloat)? = nil
-
+        
         // Use a coarse sweep: a few rays in the cone + a small AABB probe
         let rays = [-halfAngle * 0.6, 0, halfAngle * 0.6]
         for off in rays {
@@ -746,7 +754,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
                 }
             }
         }
-
+        
         // Extra: local box in front (helps for very near obstacles)
         let probeW: CGFloat = 90
         let probeL: CGFloat = min(maxDist, 180)
@@ -760,10 +768,10 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
                 if closest == nil || d < closest!.d { closest = (n, d) }
             }
         }
-
+        
         return closest?.n
     }
-
+    
     private func fireBurst(_ car: CarNode, duration: TimeInterval = 0.18) {
         // Start auto-fire briefly to clear geometry
         car.startAutoFire(on: self)
@@ -772,12 +780,12 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
             .run { [weak car] in car?.stopAutoFire() }
         ]))
     }
-
+    
     private func aiTacticalFireIfNeeded(shooter: CarNode, target: CarNode) {
         let now = CACurrentMediaTime()
         let key = ObjectIdentifier(shooter)
         if let lock = aiBurstLockout[key], now < lock { return }
-
+        
         // (1) If LoS to target → standard aim/LoS rule (keeps your PvP behavior)
         let (los, blocker) = lineOfSightOrBlocker(from: shooter, to: target)
         if los {
@@ -788,14 +796,14 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
             }
             return
         }
-
+        
         // (2) If LoS is blocked by a destructible obstacle → clear it
         if let n = blocker, isDestructibleObstacleNode(n) {
             fireBurst(shooter, duration: 0.22)
             aiBurstLockout[key] = now + 0.28
             return
         }
-
+        
         // (3) No target LoS: proactively clear obstacle straight ahead (path opening)
         if let _ = firstObstacleAheadInCone(for: shooter, maxDist: 520, halfAngle: .pi/10) {
             fireBurst(shooter, duration: 0.18)
@@ -1221,12 +1229,12 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
     
     private func updateEnemyBlipOnHeadingHUD() {
         guard let cam = camera else { return }
-
+        
         // pick nearest enemy that is off-screen but within range
         let viewRect = cameraViewRect.insetBy(dx: enemyBlipScreenMargin, dy: enemyBlipScreenMargin)
         let myPos = car.position
         var best: (node: CarNode, dist: CGFloat)?
-
+        
         for e in cars where e.kind == .enemy && !e.isDead {
             let d = myPos.distance(to: e.position)
             if d >= enemyBlipMaxDistance { continue }
@@ -1234,7 +1242,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
             if viewRect.contains(eCam) { continue } // on-screen → no blip
             if best == nil || d < best!.dist { best = (e, d) }
         }
-
+        
         guard let enemy = best?.node else {
             if !enemyBlip.isHidden {
                 enemyBlip.removeAction(forKey: "blink")
@@ -1242,16 +1250,16 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
             }
             return
         }
-
+        
         // place the dot on the compass rim at the absolute bearing to the enemy
         let a = atan2(enemy.position.y - myPos.y, enemy.position.x - myPos.x) // world bearing to enemy
         let r = (headingSize * 0.5) - 12                                      // just inside the dial
         enemyBlip.position = CGPoint(x: cos(a) * r, y: sin(a) * r)
-
+        
         // color intensity by proximity (optional)
         let t = max(0, 1 - (best!.dist / enemyBlipMaxDistance))
         enemyBlip.fillColor = UIColor.systemRed.withAlphaComponent(0.65 + 0.35 * t)
-
+        
         // show & blink
         if enemyBlip.isHidden {
             enemyBlip.alpha = 0
@@ -1264,7 +1272,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
             enemyBlip.run(.repeatForever(.sequence([up, dn])), withKey: "blink")
         }
     }
-
+    
     
     private func makeNeedlePath(length: CGFloat, width: CGFloat, tipRadius: CGFloat) -> CGPath {
         let half = width * 0.5
@@ -1312,7 +1320,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         cam.removeAllActions()
         cam.position = t.position
     }
-
+    
     // Keep the camera lock AFTER physics each frame so it never lags
     override func didSimulatePhysics() {
         super.didSimulatePhysics()
@@ -1497,12 +1505,12 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
     
     func carNodeDidRunOutOfLives(_ car: CarNode) {
         guard let cam = camera else { return }
-       
+        
         if car.kind == .player {
             cameraFrozenPos = self.car.position
             pauseWorldForDeath()
             gameOverOverlay.show(in: cam, size: size)
-
+            
             // NEW: auto restart if AI drives the player
             scheduleAutoRestartIfAIControlled(delay: aiAutoRestartDelay)
             return
@@ -1521,7 +1529,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
             cameraFrozenPos = self.car.position
             pauseWorldForDeath()
             winOverlay.show(in: cam, size: size)
-
+            
             // NEW: auto restart if AI drives the player
             scheduleAutoRestartIfAIControlled(delay: aiAutoRestartDelay)
         }
@@ -1534,7 +1542,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         playerRLServer = nil
         enemyRLServer  = nil
     }
-
+    
     // Start/refresh BOTH sides to use the SAME path
     // - train == true  → live RL via RLServer on two ports
     // - train == false → both sides load the same learned policy
@@ -1574,7 +1582,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
             }
         }
     }
-
+    
     // Toggle AI control of the PLAYER (keeps Kind.player for HUD/UX)
     func setAIControlsPlayer(_ enabled: Bool, training: Bool = true, policyName: String = "IonCircuitPolicy") {
         aiControlsPlayer  = enabled         // your touch handlers already guard on this
@@ -1966,16 +1974,43 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
                 let key = chunkKey(cx: cx, cy: cy)
                 want.insert(key)
                 if loadedChunks[key] == nil || force {
-                    spawnChunk(cx: cx, cy: cy)
+                    // Queue instead of building immediately
+                    pendingChunkLoads.append((cx, cy))
                 }
             }
         }
         
         if !force {
             for (key, nodes) in loadedChunks where !want.contains(key) {
-                for n in nodes { n.removeAllActions(); n.removeFromParent() }
+                // Queue graceful unload
+                pendingChunkUnloads.append(nodes)
                 loadedChunks.removeValue(forKey: key)
             }
+        }
+    }
+    
+    private func processStreamQueues() {
+        // Load a few chunks
+        var loaded = 0
+        while loaded < streamChunkLoadBudgetPerFrame, !pendingChunkLoads.isEmpty {
+            let (cx, cy) = pendingChunkLoads.removeFirst()
+            let key = chunkKey(cx: cx, cy: cy)
+            if loadedChunks[key] == nil { spawnChunk(cx: cx, cy: cy) }
+            loaded += 1
+        }
+        
+        // Unload nodes in small batches
+        var removed = 0
+        while removed < streamNodeUnloadBudgetPerFrame, !pendingChunkUnloads.isEmpty {
+            var arr = pendingChunkUnloads[0]
+            while removed < streamNodeUnloadBudgetPerFrame, !arr.isEmpty {
+                let n = arr.removeLast()
+                n.removeAllActions()
+                n.removeFromParent()
+                removed += 1
+            }
+            if arr.isEmpty { pendingChunkUnloads.removeFirst() }
+            else { pendingChunkUnloads[0] = arr }
         }
     }
     
@@ -1994,7 +2029,6 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         loadedChunks[key] = nodes
     }
     
-    // Lower density, better spacing, deterministic per chunk
     private func spawnObstacles(in rect: CGRect, nodesOut: inout [SKNode], cx: Int, cy: Int) {
         let barrierChance: CGFloat = 0.10
         let coneRowChanceLocal: CGFloat = 0.16
@@ -2003,6 +2037,13 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         let pad: CGFloat = max(28, obstacleCell * 0.08)
         let cols = Int(ceil(rect.width / obstacleCell))
         let rows = Int(ceil(rect.height / obstacleCell))
+        
+        // One-time blocker cache for this chunk (inflate a bit for clearances)
+        let query = rect.insetBy(dx: -(obstacleClearanceMajor + 24), dy: -(obstacleClearanceMajor + 24))
+        var blockers = gatherSpawnBlockers(in: query)
+        
+        // As we place inside this chunk, also track the frames we just added
+        var placedThisChunk: [CGRect] = []
         
         let worldCenter = CGPoint(x: worldBounds.midX, y: worldBounds.midY)
         
@@ -2028,36 +2069,38 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
                 let placeP: CGFloat = 0.14 + 0.28 * falloff
                 if !rng.chance(placeP) { continue }
                 
-                if hasNeighborObstacle(near: a, radius: minNeighborSpacing) { continue }
+                // Fast clearance: check vs cached blockers and what we placed this chunk
+                if circleIntersectsAny(center: a, radius: obstacleClearanceMajor, rects: blockers) { continue }
+                if circleIntersectsAny(center: a, radius: minNeighborSpacing, rects: placedThisChunk) { continue }
                 
-                let avoidMask: UInt32 = Category.wall | Category.obstacle | Category.hole | Category.car
-                if !clearanceOK(at: a, radius: obstacleClearanceMajor, mask: avoidMask) { continue }
-                
-                var placedSomething = false
                 var placedNodes: [SKNode] = []
+                var placedSomething = false
                 
-                // barrier
+                // --- barrier + two cones behind it ---
                 if rng.chance(barrierChance) {
                     let dir = CGVector(dx: a.x - worldCenter.x, dy: a.y - worldCenter.y)
                     let rot = atan2(dir.dy, dir.dx)
                     
-                    if !hasNeighborObstacle(near: a, radius: minNeighborSpacing),
-                       let barrier = placeObstacleTracked(.barrier, at: a, rotation: rot) {
-                        placedSomething = true
+                    if let barrier = placeObstacleTracked(.barrier, at: a, rotation: rot, skipPhysicsClearance: true) {
                         placedNodes.append(barrier)
+                        placedSomething = true
                         
                         let back = CGPoint(x: a.x - cos(rot) * 56, y: a.y - sin(rot) * 56)
                         let left = CGPoint(x: back.x - sin(rot) * 16, y: back.y + cos(rot) * 16)
                         let right = CGPoint(x: back.x + sin(rot) * 16, y: back.y - cos(rot) * 16)
                         
-                        if !hasNeighborObstacle(near: left, radius: minNeighborSpacing),
-                           let l = placeObstacleTracked(.cone, at: left, rotation: rot) { placedNodes.append(l) }
-                        if !hasNeighborObstacle(near: right, radius: minNeighborSpacing),
-                           let r = placeObstacleTracked(.cone, at: right, rotation: rot) { placedNodes.append(r) }
+                        if !circleIntersectsAny(center: left,  radius: minNeighborSpacing, rects: blockers + placedThisChunk),
+                           let l = placeObstacleTracked(.cone, at: left, rotation: rot, skipPhysicsClearance: true) {
+                            placedNodes.append(l)
+                        }
+                        if !circleIntersectsAny(center: right, radius: minNeighborSpacing, rects: blockers + placedThisChunk),
+                           let r = placeObstacleTracked(.cone, at: right, rotation: rot, skipPhysicsClearance: true) {
+                            placedNodes.append(r)
+                        }
                     }
                 }
                 
-                // cone row
+                // --- cone row ---
                 if !placedSomething, rng.chance(coneRowChanceLocal) {
                     let baseRot: CGFloat = (rng.chance(0.5) ? 0 : .pi/2)
                     let rot = baseRot + (.pi/12) * (rng.range(-1...1))
@@ -2071,51 +2114,38 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
                             x: a.x + cos(rot) * coneSpacing * t,
                             y: a.y + sin(rot) * coneSpacing * t
                         )
-                        
-                        if hasNeighborObstacle(near: p, radius: minNeighborSpacing) { ok = false; break }
-                        
-                        if let n = placeObstacleTracked(.cone, at: p, rotation: rot) {
+                        if circleIntersectsAny(center: p, radius: minNeighborSpacing, rects: blockers + placedThisChunk) { ok = false; break }
+                        if let n = placeObstacleTracked(.cone, at: p, rotation: rot, skipPhysicsClearance: true) {
                             rowNodes.append(n)
-                        } else {
-                            ok = false; break
-                        }
+                        } else { ok = false; break }
                     }
-                    
-                    if ok {
-                        placedSomething = true
-                        placedNodes.append(contentsOf: rowNodes)
-                    } else {
-                        rowNodes.forEach { $0.removeFromParent() }
-                    }
+                    if ok { placedNodes.append(contentsOf: rowNodes); placedSomething = true }
+                    else  { rowNodes.forEach { $0.removeFromParent() } }
                 }
                 
-                // single scatter
+                // --- single scatter ---
                 if !placedSomething {
                     let u = rng.unit()
-                    let kind: ObstacleKind
-                    if u < steelChanceSingle { kind = .steel }
-                    else if u < 0.60 { kind = .rock }
-                    else { kind = .barrel }
-                    
+                    let kind: ObstacleKind = (u < steelChanceSingle) ? .steel : (u < 0.60 ? .rock : .barrel)
                     let rot = rng.range(-(.pi/8)...(.pi/8))
-                    if !hasNeighborObstacle(near: a, radius: minNeighborSpacing),
-                       let n = placeObstacleTracked(kind, at: a, rotation: rot) {
-                        placedSomething = true
-                        placedNodes.append(n)
+                    if let n = placeObstacleTracked(kind, at: a, rotation: rot, skipPhysicsClearance: true) {
+                        placedNodes.append(n); placedSomething = true
                     }
                 }
                 
                 if placedSomething {
                     nodesOut.append(contentsOf: placedNodes)
+                    // Add their frames to caches so next placements respect spacing
+                    for n in placedNodes {
+                        blockers.append(n.calculateAccumulatedFrame())
+                        placedThisChunk.append(n.calculateAccumulatedFrame())
+                    }
                 }
             }
         }
     }
     
     // MARK: - Placement utilities
-    
-    // MARK: - Placement utilities
-    
     @discardableResult
     private func clearanceOK(
         at p: CGPoint,
@@ -2157,21 +2187,24 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
     // ─────────────────────────────────────────────────────────────────────────────
     
     @discardableResult
-    private func placeObstacleTracked(_ kind: ObstacleKind, at p: CGPoint, rotation: CGFloat = 0) -> SKNode? {
+    private func placeObstacleTracked(_ kind: ObstacleKind,
+                                      at p: CGPoint,
+                                      rotation: CGFloat = 0,
+                                      skipPhysicsClearance: Bool = false) -> SKNode? {
         if !pointInBorderBand(p) { return nil }
         
-        let avoidMask: UInt32 = Category.wall | Category.obstacle | Category.hole | Category.ramp | Category.car
-        if !clearanceOK(at: p, radius: obstacleClearanceMajor, mask: avoidMask) { return nil }
-        
+        if !skipPhysicsClearance {
+            let avoidMask: UInt32 = Category.wall | Category.obstacle | Category.hole | Category.ramp | Category.car
+            if !clearanceOK(at: p, radius: obstacleClearanceMajor, mask: avoidMask) { return nil }
+        }
         let node = ObstacleFactory.make(kind)
         node.position = p
         node.zRotation = rotation
         node.zPosition = 1
-        
         if let pb = node.physicsBody {
-            pb.restitution = 0         // ← NEW
-            pb.friction = 0            // ← NEW (already common, just enforce)
-            pb.usesPreciseCollisionDetection = true
+            pb.restitution = 0
+            pb.friction = 0
+            // pb.usesPreciseCollisionDetection = true  // keep off for statics
         }
         obstacleRoot.addChild(node)
         return node
@@ -2243,7 +2276,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
     private func pathClearCapsule(from a: CGPoint, to b: CGPoint, radius r: CGFloat, mask: UInt32) -> Bool {
         let dx = b.x - a.x, dy = b.y - a.y
         let dist = hypot(dx, dy)
-        let steps = max(1, Int(ceil(dist / max(24, r * 0.75))))
+        let steps = max(1, Int(ceil(dist / max(72, r * 1.25))))
         for i in 0...steps {
             let t = CGFloat(i) / CGFloat(steps)
             let p = CGPoint(x: a.x + dx * t, y: a.y + dy * t)
@@ -2262,15 +2295,15 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
                                  runupRange: ClosedRange<CGFloat> = 520...900,
                                  corridorHalfWidth: CGFloat = 56,
                                  rng: inout SplitMix64) -> RampNode? {
-
+        
         let f = hill.calculateAccumulatedFrame()
         let center = CGPoint(x: f.midX, y: f.midY)
         let rx = f.width  * 0.5
         let ry = f.height * 0.5
         let worldCtr = CGPoint(x: worldBounds.midX, y: worldBounds.midY)
-
+        
         @inline(__always) func dir(_ a: CGFloat) -> CGVector { .init(dx: cos(a), dy: sin(a)) }
-
+        
         let baseHeading = atan2(center.y - worldCtr.y, center.x - worldCtr.x)
         let candidates: [CGFloat] = [
             baseHeading,
@@ -2278,46 +2311,46 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
             baseHeading - (.pi/10),
             rng.range(-.pi ... .pi)     // a wild-card direction for variety
         ]
-
+        
         let rampWidthRange: ClosedRange<CGFloat>  = 74...98
-        let rampLengthRange: ClosedRange<CGFloat> = 110...160
+        let rampLengthRange: ClosedRange<CGFloat> = 120...180
         let corridorMask: UInt32 = Category.wall | Category.obstacle | Category.hole | Category.ramp
-
+        
         for heading in candidates {
             let d = dir(heading)
-
+            
             // Where the ellipse edge lies along this direction
             let edge = ellipseRadiusAlong(rx: rx, ry: ry, vx: d.dx, vy: d.dy)
-
+            
             // Place ramp just outside the hill edge, pointing toward the hill
             let gap: CGFloat = 70
             let rampCenter = CGPoint(x: center.x - d.dx * (edge + gap),
                                      y: center.y - d.dy * (edge + gap))
-
+            
             // ✅ Loosen region gating:
             if rampsBorderOnly {
                 guard pointInBorderBand(rampCenter) else { continue }
             } else {
                 guard worldBounds.contains(rampCenter) else { continue }
             }
-
+            
             // Sample a run-up start point behind the ramp
             let runLen = rng.range(runupRange)
             let start  = CGPoint(x: rampCenter.x - d.dx * runLen,
                                  y: rampCenter.y - d.dy * runLen)
-
+            
             if rampsBorderOnly {
                 guard pointInBorderBand(start) else { continue }
                 // (no need to keep the entire segment inside the band anymore)
             } else {
                 guard worldBounds.contains(start) else { continue }
             }
-
+            
             // Corridor must be clear of walls/obstacles/holes/ramps
             guard pathClearCapsule(from: start, to: rampCenter,
                                    radius: corridorHalfWidth,
                                    mask: corridorMask) else { continue }
-
+            
             // Build ramp footprint; ensure its tip & tail lie inside the world
             let rampSize = CGSize(width: rng.range(rampWidthRange),
                                   height: rng.range(rampLengthRange))
@@ -2325,12 +2358,12 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
             let tip  = CGPoint(x: rampCenter.x + d.dx * halfL, y: rampCenter.y + d.dy * halfL)
             let tail = CGPoint(x: rampCenter.x - d.dx * halfL, y: rampCenter.y - d.dy * halfL)
             guard worldBounds.contains(tip), worldBounds.contains(tail) else { continue }
-
+            
             // Vertical impulse needed to reach hill top from this point
             let g = abs(car.gravity)
             let heightToReach = max(0, hill.topHeight - groundHeight(at: rampCenter))
-            let vzNeeded = sqrt(max(1, 2 * g * max(20, heightToReach * 1.05)))
-
+            let vzNeeded = sqrt(max(1, 2 * g * max(20, heightToReach * 1.05))) * 1.25
+            
             let ramp = RampNode(center: rampCenter, size: rampSize, heading: heading, strengthZ: vzNeeded)
             ramp.zPosition = 0.4
             obstacleRoot.addChild(ramp)
@@ -2341,49 +2374,49 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
     
     private func spawnHillsAndRamps(in rect: CGRect, nodesOut: inout [SKNode], cx: Int, cy: Int) {
         var rng = SplitMix64(seed: hash2(cx &* 7919, cy &* 104729, seed: worldSeed ^ 0xC0FFEE))
-
+        
         // Density / tuning
         let hillsPerChunkChance: CGFloat = 0.58
         let hillsPerChunkMax = 2
         let rampsPerHillTarget = 3
         let rampRunupRange: ClosedRange<CGFloat> = 520...1000
         let rampCorridorHalfWidth: CGFloat = 56
-
+        
         // How many hills this chunk wants
         let wantHills = (rng.chance(hillsPerChunkChance) ? 1 : 0)
-                      + (rng.chance(hillsPerChunkChance * 0.50) ? 1 : 0)
+        + (rng.chance(hillsPerChunkChance * 0.50) ? 1 : 0)
         let count = min(wantHills, hillsPerChunkMax)
-
+        
         // Stay away from chunk edges a bit when sampling candidate centers
         let pad: CGFloat = max(140, obstacleCell * 0.22)
         let allowed = rect.insetBy(dx: pad, dy: pad)
-
+        
         for _ in 0..<count {
             // Random size and candidate center
             let sz = CGSize(width:  rng.range(320...540),
                             height: rng.range(220...420))
             let c  = CGPoint(x: rng.range(allowed.minX...allowed.maxX),
                              y: rng.range(allowed.minY...allowed.maxY))
-
+            
             // Hill rect we intend to place
             let rectHill = CGRect(x: c.x - sz.width/2, y: c.y - sz.height/2,
                                   width: sz.width, height: sz.height)
-
+            
             // ✅ Loosen region gating:
             if hillsBorderOnly {
                 guard rectFullyInBorderBand(rectHill) else { continue }
             } else {
                 guard worldBounds.contains(rectHill) else { continue }
             }
-
+            
             // Spacing & safety
             let minHillSpacing = max(minNeighborSpacing, max(sz.width, sz.height))
             if c.distance(to: car.position) < max(minHillSpacing, obstacleKeepOutFromCar) { continue }
             if hills.contains(where: { $0.parent != nil && $0.calculateAccumulatedFrame().intersects(rectHill.insetBy(dx: -24, dy: -24)) }) { continue }
-
+            
             let avoidMask: UInt32 = Category.wall | Category.obstacle | Category.hole | Category.ramp | Category.car
             if !clearanceOK(at: c, radius: minHillSpacing * 0.6, mask: avoidMask) { continue }
-
+            
             // Create hill
             let h = rng.range(90...180)
             let hill = HillNode(rect: rectHill, height: h)
@@ -2391,18 +2424,18 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
             addChild(hill)
             hills.append(hill)
             nodesOut.append(hill)
-
+            
             // Try placing ramps for this hill
             var made = 0
             for _ in 0..<rampsPerHillTarget {
                 if var localRNG = Optional(rng), let r = placeUsefulRamp(for: hill,
-                                                                          runupRange: rampRunupRange,
-                                                                          corridorHalfWidth: rampCorridorHalfWidth,
-                                                                          rng: &localRNG) {
+                                                                         runupRange: rampRunupRange,
+                                                                         corridorHalfWidth: rampCorridorHalfWidth,
+                                                                         rng: &localRNG) {
                     nodesOut.append(r); made += 1
                 }
             }
-
+            
             // Fallback ramp if none succeeded (slightly relaxed)
             if made == 0 {
                 var relaxed = rng
@@ -2413,7 +2446,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
                     nodesOut.append(r)
                 }
             }
-
+            
             // Hill enhancement
             maybeSpawnEnhancement(on: hill, rng: &rng)
         }
@@ -2489,8 +2522,13 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         lastUpdateTime = currentTime
         voidTime += max(0, Float(dt))
         voidTimeUniform.floatValue = voidTime
-
-        buildIonVoidFX()
+        
+        //        buildIonVoidFX()
+        
+        if currentTime >= nextRampPointerUpdate {
+            updateRampPointer()
+            nextRampPointerUpdate = currentTime + rampPointerUpdateInterval
+        }
         
         updateCameraFollow(dt: dt)
         stepEnhancementHUD(dt)
@@ -2516,6 +2554,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         }
         
         maybeUpdateObstacleStreaming(currentTime)
+        processStreamQueues()
         
         if !car.isDead, isTouching, controlArmed, let f = fingerCam, let pb = car.physicsBody {
             isCoasting = false
@@ -2629,8 +2668,8 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         
         // Keep the vertical axis in sync with terrain (smooth hill profile)
         for car in cars {
-            let gh = groundHeight(at: car.position)
-            applyHillModifiers(for: car, gh: gh)
+            let (gh, gvec) = groundHeightAndGradient(at: car.position)
+            applyHillModifiers(for: car, gh: gh, gradient: gvec)
             car.stepVertical(dt: dt, groundHeight: gh)
             car.update(dt)
         }
@@ -2647,7 +2686,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
                 }
             }
         }
-
+        
         if aiControlsPlayer {
             // If player is heuristic AI (not RL), clear path and shoot as needed.
             if !rlControlsPlayer, let enemyForPlayer = cars.first(where: { $0.kind == .enemy && !$0.isDead }) {
@@ -2676,18 +2715,38 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         updateRampPointer()
         cullBulletsOutsideWorld()
         seedObstaclesFromEnemies()
+    }
+    
+    @inline(__always)
+    private func gatherSpawnBlockers(in region: CGRect) -> [CGRect] {
+        var rects: [CGRect] = []
+        let avoidMask: UInt32 = Category.wall | Category.obstacle | Category.hole | Category.ramp | Category.car
         
-        if let body = car.physicsBody {
-            body.enableWallCollision(!isInsideAnyHill(car.position))
-        }
-        
-        // Enemies (if you have an array like `enemies: [CarNode]`)
-        let enemies = cars.filter({ $0.kind == .enemy })
-        for e in enemies {
-            if let body = e.physicsBody {
-                body.enableWallCollision(!isInsideAnyHill(e.position))
+        // One physics query for the whole region
+        physicsWorld.enumerateBodies(in: region) { body, _ in
+            if (body.categoryBitMask & avoidMask) != 0, let n = body.node {
+                rects.append(n.calculateAccumulatedFrame())
             }
         }
+        // Hills are often non-physics → include their frames too
+        for h in hills where h.parent != nil {
+            let fr = h.calculateAccumulatedFrame()
+            if fr.intersects(region) { rects.append(fr) }
+        }
+        // Also include already-streamed ramps/enhancements hosted under obstacleRoot that block spawns
+        for n in obstacleRoot.children where nodeBlocksSpawn(n) {
+            let fr = n.calculateAccumulatedFrame()
+            if fr.intersects(region) { rects.append(fr) }
+        }
+        return rects
+    }
+    
+    @inline(__always)
+    private func circleIntersectsAny(center: CGPoint, radius: CGFloat, rects: [CGRect]) -> Bool {
+        for r in rects {
+            if circleIntersectsRect(center: center, radius: radius, rect: r) { return true }
+        }
+        return false
     }
     
     // Which chunk does a point belong to?
@@ -2697,7 +2756,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         let cy = Int(floor((p.y - worldBounds.minY) / chunkSize))
         return (cx, cy)
     }
-
+    
     // Track dynamic obstacles under loadedChunks so streaming can unload them later
     @inline(__always)
     private func registerDynamicObstacle(_ n: SKNode, at p: CGPoint) {
@@ -2710,21 +2769,21 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
             loadedChunks[key] = [n]
         }
     }
-
+    
     // Drive the per-enemy spawning logic
     private func seedObstaclesFromEnemies() {
         let now = CACurrentMediaTime()
         for e in cars where e.kind == .enemy && !e.isDead {
             let id = ObjectIdentifier(e)
             let s  = enemyObstacleState[id] ?? (lastT: 0, lastPos: e.position, count: 0)
-
+            
             // Basic gates: cooldown, travel distance, cap, stay in border band, don’t spawn on the player
             guard s.count < enemyObstacleMaxPerEnemy else { continue }
             guard now - s.lastT >= enemyObstacleCooldown else { continue }
             guard e.position.distance(to: s.lastPos) >= enemyObstacleTravelReq else { continue }
             guard pointInBorderBand(e.position) else { continue }
             guard car.position.distance(to: e.position) >= 220 else { continue }
-
+            
             if maybeDropObstaclePack(from: e) {
                 enemyObstacleState[id] = (lastT: now, lastPos: e.position, count: s.count + 1)
             }
@@ -2740,15 +2799,15 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         for d in enemies { pts.append(d.position) }    // enemies
         return pts
     }
-
+    
     private func carsStreamingRect(margin: CGFloat) -> CGRect {
         // preload radius around each car; using view size keeps it stable across zooms
         let base = max(size.width, size.height)
         let preloadRadius: CGFloat = base * 0.9 + margin
-
+        
         // start from camera rect to keep the near-screen area always loaded
         var rect = cameraWorldRect(margin: margin)
-
+        
         // union a square box around each car
         for p in allCarPositions {
             let box = CGRect(x: p.x - preloadRadius,
@@ -2757,25 +2816,25 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
                              height: preloadRadius * 2)
             rect = rect.union(box)
         }
-
+        
         // keep it bounded and allow a tiny bleed so borders stream in cleanly
         return rect.intersection(worldBounds.insetBy(dx: -chunkSize, dy: -chunkSize))
     }
-
-
+    
+    
     // Try to place a small “pack” of obstacles near/just ahead of the enemy.
     // Returns true if anything was placed.
     @discardableResult
     private func maybeDropObstaclePack(from enemy: CarNode) -> Bool {
         var placedAny = false
-
+        
         // Forward point ahead of the enemy
         let heading = enemy.zRotation + .pi/2
         let fwd = CGVector(dx: cos(heading), dy: sin(heading))
         let baseDist = CGFloat.random(in: 160...260)
         let base = CGPoint(x: enemy.position.x + fwd.dx * baseDist,
                            y: enemy.position.y + fwd.dy * baseDist)
-
+        
         // 55% chance: a short cone "barrier" row perpendicular to heading.
         // 45%: scatter 1–2 singles ahead with small lateral offset.
         if CGFloat.random(in: 0...1) < 0.55 {
@@ -2783,12 +2842,12 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
             let rot = heading + .pi/2 + CGFloat.random(in: (-.pi/14)...(.pi/14))  // mostly perpendicular to travel
             let count = Int.random(in: 4...6)
             var localPlaced: [SKNode] = []
-
+            
             for i in 0..<count {
                 let t = CGFloat(i) - CGFloat(count-1)*0.5
                 let p = CGPoint(x: base.x + cos(rot) * coneSpacing * t,
                                 y: base.y + sin(rot) * coneSpacing * t)
-
+                
                 if let node = placeObstacleTracked(.cone, at: p, rotation: rot) {
                     localPlaced.append(node)
                     registerDynamicObstacle(node, at: p)
@@ -2804,7 +2863,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
                 let right = CGVector(dx: -sin(heading), dy: cos(heading))
                 let p = CGPoint(x: base.x + fwd.dx * lon + right.dx * lat,
                                 y: base.y + fwd.dy * lon + right.dy * lat)
-
+                
                 let kind: ObstacleKind = (CGFloat.random(in: 0...1) < 0.5) ? .rock : .barrel
                 let rot = CGFloat.random(in: (-(.pi/8))...(.pi/8))
                 if let node = placeObstacleTracked(kind, at: p, rotation: rot) {
@@ -2813,7 +2872,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
                 }
             }
         }
-
+        
         return placedAny
     }
     
@@ -2839,15 +2898,64 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         return 0.5 * sqrt(hx*hx + hy*hy)
     }
     
+    // One pass over active hills: returns ground height and analytical gradient.
     @inline(__always)
-    private func applyHillModifiers(for car: CarNode, gh: CGFloat) {
-        if gh < 16 {                     // flat → no penalties
+    private func groundHeightAndGradient(at p: CGPoint) -> (height: CGFloat, grad: CGVector) {
+        var bestH: CGFloat = 0
+        var bestGrad = CGVector.zero
+        
+        for hill in hills where hill.parent != nil {
+            let f = hill.calculateAccumulatedFrame()
+            let cx = f.midX, cy = f.midY
+            let rx = max(1, f.width * 0.5), ry = max(1, f.height * 0.5)
+            
+            // Normalized ellipse coords
+            let dx = p.x - cx, dy = p.y - cy
+            let nx = dx / rx,  ny = dy / ry
+            let r  = sqrt(nx*nx + ny*ny)   // 1.0 ≈ edge
+            
+            if r > 1.05 { continue }       // tiny grace like your groundHeight()
+            
+            let inner: CGFloat = 0.35
+            var h: CGFloat = 0
+            var gx: CGFloat = 0, gy: CGFloat = 0
+            
+            if r <= inner {
+                h = hill.topHeight
+                // gradient 0 on the flat top
+            } else {
+                // smoothstep falloff: t = u^2 (3 - 2u), u in [0,1]
+                let u = min(1, (r - inner) / max(0.0001, (1 - inner)))
+                let t = u*u*(3 - 2*u)
+                h = hill.topHeight * (1 - t)
+                
+                // analytical gradient on the slope band
+                if r > 1e-5 && u > 0 && u < 1 {
+                    let dt_du = 6*u*(1 - u)                     // d(u^2(3-2u))/du
+                    let du_dr = 1 / max(1e-6, (1 - inner))
+                    let dh_dr = -hill.topHeight * dt_du * du_dr
+                    let dr_dx = dx / (r * rx * rx)
+                    let dr_dy = dy / (r * ry * ry)
+                    gx = dh_dr * dr_dx
+                    gy = dh_dr * dr_dy
+                }
+            }
+            
+            if h > bestH { bestH = h; bestGrad = CGVector(dx: gx, dy: gy) }
+        }
+        
+        return (bestH, bestGrad)
+    }
+    
+    @inline(__always)
+    private func applyHillModifiers(for car: CarNode, gh: CGFloat, gradient gvec: CGVector) {
+        if gh < 16 {
             car.hillSpeedMul = 1
             car.hillAccelMul = 1
             car.hillDragK    = 0
             return
         }
-        let gvec = groundGradient(at: car.position)
+        
         let gmag = hypot(gvec.dx, gvec.dy) * 0.5
         let slope = min(1, gmag / 28.0)
         
@@ -2855,13 +2963,13 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         let fwd = CGVector(dx: cos(heading), dy: sin(heading))
         let down = CGVector(dx: -gvec.dx, dy: -gvec.dy)
         
-        let downhillAlign = max(0, (fwd.dx * down.dx + fwd.dy * down.dy) / max(0.001, hypot(down.dx, down.dy)))
+        let downLen = max(0.001, hypot(down.dx, down.dy))
+        let downhillAlign = max(0, (fwd.dx * down.dx + fwd.dy * down.dy) / downLen)
         let uphillAlign   = max(0, -downhillAlign)
         
-        // match your original tuning:
         car.hillSpeedMul = 1 - 0.30 * slope * uphillAlign
         car.hillAccelMul = 1 - 0.45 * slope * uphillAlign
-        car.hillDragK    =  1.20 * slope * (1 - downhillAlign)   // small extra drag unless fully downhill
+        car.hillDragK    =  1.20 * slope * (1 - downhillAlign)
     }
     
     // ─────────────────────────────────────────────────────────────────────────────
@@ -3317,7 +3425,7 @@ extension GameScene {
             let enhBody = isEnhancement(a) ? a : b
             guard let taker = carBody.node as? CarNode,
                   let node  = enhBody.node  as? EnhancementNode else { return }
-
+            
             if taker.applyEnhancement(node.kind) {
                 // only drive the on-screen HUD if the PLAYER picked it up
                 if taker === self.car {
