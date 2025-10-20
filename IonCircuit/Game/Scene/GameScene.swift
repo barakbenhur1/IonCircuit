@@ -147,8 +147,8 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
     private var rlNextRampRewardTime    = 0.0      // CACurrentMediaTime() cooldown gate
     
     // === RL: run BOTH cars with real training ==========================
-    private var rlControlsPlayer = false      // the .player car is driven by RL
-    private var aiControlsPlayer = false
+    private var rlControlsPlayer = true      // the .player car is driven by RL
+    private var aiControlsPlayer = true
     private var rlControlsEnemy  = true      // enemies driven by RL (first enemy)
     private var playerRLServer: RLServer?
     private var enemyRLServer:  RLServer?
@@ -164,7 +164,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
     
     // ==== Air phasing for hill rim (so we can clear the wall while jumping)
     private var playerPhasingWallsUntilLand = false
-
+    
     @inline(__always)
     private func setPassThroughWallsWhileAirborne(_ car: CarNode, enabled: Bool) {
         guard let pb = car.physicsBody else { return }
@@ -183,7 +183,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
             car.userData?["origCollisionMask"] = nil
         }
     }
-
+    
     
     @inline(__always)
     private func pointInBorderBand(_ p: CGPoint) -> Bool {
@@ -311,7 +311,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         }
         print("📡 Device IP:", addr ?? "unknown")
     }
-
+    
     
     var cars: [CarNode] = []   // includes the player car
     
@@ -725,7 +725,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         }
         return result
     }
-
+    
     private func lineOfSightOrBlocker(from a: CarNode, to b: CarNode) -> (los: Bool, blocker: SKNode?) {
         let start = a.position, end = b.position
         var los = false
@@ -1374,7 +1374,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
                 u.vectorFloat2Value = .init(Float(s.position.x), Float(s.position.y))
             }
         }
-
+        
         // If we're freezing on death, don't re-center until respawn
         guard cameraFrozenPos == nil else { return }
         defer { _hadSolidContactThisStep = false }
@@ -1383,13 +1383,13 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
             // ...
             return
         }
-
+        
         // Removed the “bottom one-way” reflection
         applyHillEdgeAssist(dt: CGFloat(_lastDTForClamp))  // <- optional no-op
         recenterCameraOnTargetIfNeeded()
         _hadSolidContactThisStep = false
     }
-
+    
     // Keep as an empty hook (or remove call above entirely)
     private func applyHillEdgeAssist(dt: CGFloat) { }
     
@@ -2413,7 +2413,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         }
         return best?.node
     }
-
+    
     // Minimum vertical speed needed to reach a hill’s top from world position p
     private func requiredVzToReachTop(from p: CGPoint, to hill: HillNode) -> CGFloat {
         // how much vertical “height” we still need to gain at the ramp location
@@ -3601,15 +3601,21 @@ extension GameScene {
         let attempts = 10
         let avoid: UInt32 = Category.wall | Category.obstacle | Category.hole | Category.ramp | Category.enhancements
         
+        // Lateral jitter amplitudes (CGFloat so ranges infer correctly)
+        let latA: CGFloat = 18.18
+        let latB: CGFloat = 20.20
+        let latC: CGFloat = 24.24
+        
         // 1) Precise ray hit on anything in the obstacle's subtree
         if let hit = rayHitPoint(on: ob, start: start, end: end) {
             for step in 0..<attempts {
                 let extra = CGFloat(step) * 10
-                let lat   = rng.range(-18...18)
-                let p = CGPoint(x: hit.x + dir.dx * (baseGap + extra) + sx * lat,
-                                y: hit.y + dir.dy * (baseGap + extra) + sy * lat)
+                let lat   = rng.range(-latA...latA)          // ClosedRange<CGFloat>
+                let p = CGPoint(
+                    x: hit.x + dir.dx * (baseGap + extra) + sx * lat,
+                    y: hit.y + dir.dy * (baseGap + extra) + sy * lat
+                )
                 if worldBounds.contains(p),
-                   pointInBorderBand(p),                                 // 🔒 keep inside border band
                    clearanceOK(at: p, radius: 24, mask: avoid, ignoring: ignoreSet) {
                     return p
                 }
@@ -3621,11 +3627,12 @@ extension GameScene {
         let rad = 0.5 * max(fr.width, fr.height)
         for step in 0..<attempts {
             let extra = CGFloat(step) * 12
-            let lat   = rng.range(-20...20)
-            let p = CGPoint(x: fr.midX + dir.dx * (rad + baseGap + extra) + sx * lat,
-                            y: fr.midY + dir.dy * (rad + baseGap + extra) + sy * lat)
+            let lat   = rng.range(-latB...latB)              // ClosedRange<CGFloat>
+            let p = CGPoint(
+                x: fr.midX + dir.dx * (rad + baseGap + extra) + sx * lat,
+                y: fr.midY + dir.dy * (rad + baseGap + extra) + sy * lat
+            )
             if worldBounds.contains(p),
-               pointInBorderBand(p),                                     // 🔒 keep inside border band
                clearanceOK(at: p, radius: 24, mask: avoid, ignoring: ignoreSet) {
                 return p
             }
@@ -3635,11 +3642,12 @@ extension GameScene {
         let sweepSteps = 24
         for step in 0..<sweepSteps {
             let out = baseGap + CGFloat(step) * 16
-            let lat = rng.range(-24...24)
-            let p = CGPoint(x: obWorld.x + dir.dx * (rad + out) + sx * lat,
-                            y: obWorld.y + dir.dy * (rad + out) + sy * lat)
+            let lat = rng.range(-latC...latC)                // ClosedRange<CGFloat>
+            let p = CGPoint(
+                x: obWorld.x + dir.dx * (rad + out) + sx * lat,
+                y: obWorld.y + dir.dy * (rad + out) + sy * lat
+            )
             if worldBounds.contains(p),
-               pointInBorderBand(p),                                     // 🔒 keep inside border band
                clearanceOK(at: p, radius: 24, mask: avoid, ignoring: ignoreSet) {
                 return p
             }

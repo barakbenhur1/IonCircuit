@@ -65,7 +65,6 @@ final class HillNode: SKNode {
         let tex = Self.makeHillTexture(
             outerSize: outerRect.size,
             innerSize: innerRect.size,
-            hue: 0.33,                  // green-ish
             lightDirection: .pi * 1.25  // light from top-left
         )
         let sprite = SKSpriteNode(texture: tex, size: outerRect.size)
@@ -77,7 +76,6 @@ final class HillNode: SKNode {
     private static func makeHillTexture(
         outerSize: CGSize,
         innerSize: CGSize,
-        hue: CGFloat,
         lightDirection: CGFloat
     ) -> SKTexture {
         let fmt = UIGraphicsImageRendererFormat.default()
@@ -102,9 +100,10 @@ final class HillNode: SKNode {
             let baseGrad = CGGradient(
                 colorsSpace: CGColorSpaceCreateDeviceRGB(),
                 colors: [
-                    UIColor(hue: hue, saturation: 0.52, brightness: 0.28, alpha: 1).cgColor,
-                    UIColor(hue: hue, saturation: 0.38, brightness: 0.52, alpha: 1).cgColor,
-                    UIColor(hue: hue, saturation: 0.26, brightness: 0.62, alpha: 1).cgColor
+                    Ion.palette.edge.cgColor,
+                    Ion.palette.deep.cgColor,
+                    Ion.palette.neon.cgColor,
+                   
                 ] as CFArray,
                 locations: [0.0, 0.55, 1.0]
             )!
