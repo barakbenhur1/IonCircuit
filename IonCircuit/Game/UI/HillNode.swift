@@ -8,6 +8,12 @@
 import SpriteKit
 import UIKit
 
+/// Elliptical hill with a **blocking rim** (acts like a wall) and a flat “top” area you can land on.
+/// The rim is implemented two ways for robustness:
+///  1) A static edge-loop physics body (cheap, accurate)
+///  2) A ring of hidden static “posts” along the rim (prevents tunneling at high speeds)
+///
+/// Works with your current `CarNode` masks out of the box because the rim uses `Category.wall`.
 final class HillNode: SKNode {
     // World-space frame and landing height (used by GameScene.groundHeight)
     let rectWorld: CGRect
@@ -38,7 +44,7 @@ final class HillNode: SKNode {
         self.name = "hill"
         
         buildUI()
-        buildPhysics()
+        buildPhysics()              // edge loop (+ guard posts)
     }
     
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -75,7 +81,7 @@ final class HillNode: SKNode {
         lightDirection: CGFloat
     ) -> SKTexture {
         let fmt = UIGraphicsImageRendererFormat.default()
-        fmt.opaque = false                                // <- crucial: no black box
+        fmt.opaque = false
         let img = UIGraphicsImageRenderer(size: outerSize, format: fmt).image { ctx in
             let cg = ctx.cgContext
             let W = outerSize.width, H = outerSize.height
@@ -92,13 +98,13 @@ final class HillNode: SKNode {
             cg.addEllipse(in: outerR)
             cg.clip()
 
-            // --- Base dome gradient (darker rim → lighter center)
+            // Base dome gradient (darker rim → lighter center)
             let baseGrad = CGGradient(
                 colorsSpace: CGColorSpaceCreateDeviceRGB(),
                 colors: [
-                    UIColor(hue: hue, saturation: 0.52, brightness: 0.28, alpha: 1).cgColor, // rim
-                    UIColor(hue: hue, saturation: 0.38, brightness: 0.52, alpha: 1).cgColor, // mid
-                    UIColor(hue: hue, saturation: 0.26, brightness: 0.62, alpha: 1).cgColor  // center
+                    UIColor(hue: hue, saturation: 0.52, brightness: 0.28, alpha: 1).cgColor,
+                    UIColor(hue: hue, saturation: 0.38, brightness: 0.52, alpha: 1).cgColor,
+                    UIColor(hue: hue, saturation: 0.26, brightness: 0.62, alpha: 1).cgColor
                 ] as CFArray,
                 locations: [0.0, 0.55, 1.0]
             )!
@@ -106,12 +112,12 @@ final class HillNode: SKNode {
             let innerR = min(innerSize.width, innerSize.height) * 0.50
             cg.drawRadialGradient(
                 baseGrad,
-                startCenter: center, startRadius: rimR,    // from rim…
-                endCenter:   center, endRadius: innerR,    // …to center
+                startCenter: center, startRadius: rimR,
+                endCenter:   center, endRadius: innerR,
                 options: [.drawsAfterEndLocation]
             )
 
-            // --- Ambient “vignette” at the outer edge (soft AO toward rim)
+            // Ambient vignette at the rim
             let rimAO = CGGradient(
                 colorsSpace: CGColorSpaceCreateDeviceRGB(),
                 colors: [UIColor(white: 0, alpha: 0.30).cgColor,
@@ -125,7 +131,7 @@ final class HillNode: SKNode {
                 options: [.drawsAfterEndLocation]
             )
 
-            // --- Directional highlight (specular lobe toward the light)
+            // Directional highlight
             let hlC = CGPoint(x: center.x + cos(lightDirection) * W * 0.18,
                               y: center.y + sin(lightDirection) * H * 0.18)
             let spec = CGGradient(
@@ -141,21 +147,20 @@ final class HillNode: SKNode {
                 options: [.drawsAfterEndLocation]
             )
 
-            // --- Contour “curves” (topographic rings between inner and outer)
+            // Contour rings
             let rings = 7
             let insetDX = (W - innerSize.width) * 0.5
             let insetDY = (H - innerSize.height) * 0.5
             for i in 0..<rings {
-                let t = CGFloat(i + 1) / CGFloat(rings + 1) // 0→1 (outer→inner)
-                let aBright = 0.10 * pow(1 - t, 0.8)        // brighter near center
+                let t = CGFloat(i + 1) / CGFloat(rings + 1)
+                let aBright = 0.10 * pow(1 - t, 0.8)
                 let aDark   = 0.06 * pow(1 - t, 0.8)
 
                 let rect = outerR.insetBy(dx: insetDX * t, dy: insetDY * t)
                 cg.setLineWidth(2)
-                // bright ridge
                 cg.setStrokeColor(UIColor(white: 1, alpha: aBright).cgColor)
                 cg.strokeEllipse(in: rect)
-                // shadowed lower side of the same ring (directional)
+
                 cg.saveGState()
                 cg.addEllipse(in: rect)
                 cg.replacePathWithStrokedPath()
@@ -184,18 +189,50 @@ final class HillNode: SKNode {
         return t
     }
 
-    // MARK: - Physics
+    // MARK: - Physics (edge loop + guard posts so cars really can't slip through)
     private func buildPhysics() {
-        // A thin edge loop around the outer rim acts as a "wall".
-        // Cars cannot drive up unless they jump over it.
+        // 1) Edge-loop rim that acts like a wall (matches CarNode’s collisionBitMask)
         let pb = SKPhysicsBody(edgeLoopFrom: rimPath)
         pb.isDynamic = false
+        pb.affectedByGravity = false
         pb.friction = 0.8
         pb.restitution = 0.05
-        pb.categoryBitMask = Category.wall
-        pb.collisionBitMask = Category.car | Category.obstacle | Category.bullet
-        pb.contactTestBitMask = 0
+        
+        pb.categoryBitMask    = Category.wall                 // ← IMPORTANT
+        pb.collisionBitMask   = Category.car                  // collide with cars
+        pb.contactTestBitMask = Category.car                  // if you want contact callbacks
         self.physicsBody = pb
+        
+        // 2) Hidden “posts” along the rim to prevent tunneling at high speed.
+        //    These are tiny static circular bodies placed on the ellipse.
+        addGuardPostsAlongRim(
+            postCount: max(18, Int((rectWorld.width + rectWorld.height) / 32.0)), // scale with size
+            radius: 6.0
+        )
+    }
+    
+    private func addGuardPostsAlongRim(postCount: Int, radius: CGFloat) {
+        let rx = outerRect.width * 0.5
+        let ry = outerRect.height * 0.5
+        let n  = max(8, postCount)
+        for i in 0..<n {
+            let t = CGFloat(i) / CGFloat(n)
+            let ang = t * .pi * 2
+            let p = CGPoint(x: cos(ang) * rx, y: sin(ang) * ry)
+            
+            // Invisible node with a small static circle body
+            let post = SKNode()
+            post.position = p
+            post.physicsBody = SKPhysicsBody(circleOfRadius: radius)
+            post.physicsBody?.isDynamic = false
+            post.physicsBody?.affectedByGravity = false
+            post.physicsBody?.friction = 0.2   // was 0.9
+            post.physicsBody?.restitution = 0.02
+            post.physicsBody?.categoryBitMask    = Category.wall
+            post.physicsBody?.collisionBitMask   = Category.car
+            post.physicsBody?.contactTestBitMask = 0
+            addChild(post)
+        }
     }
     
     // MARK: - Query
@@ -206,7 +243,7 @@ final class HillNode: SKNode {
         return corePath.contains(pLocal)
     }
     
-    // MARK: - Texture helpers
+    // MARK: - (Optional) Texture helpers
     private static func makeRadialGradient(size: CGSize, inner: UIColor, outer: UIColor) -> SKTexture {
         let w = max(2, Int(ceil(size.width)))
         let h = max(2, Int(ceil(size.height)))
@@ -214,13 +251,10 @@ final class HillNode: SKNode {
 
         let img = UIGraphicsImageRenderer(size: px).image { ctx in
             let cg = ctx.cgContext
-
-            // Clip drawing to an ellipse the size of the texture
             let ellipseRect = CGRect(origin: .zero, size: px)
             cg.addEllipse(in: ellipseRect)
             cg.clip()
 
-            // Radial gradient (center → edge)
             let colors = [inner.cgColor, outer.cgColor] as CFArray
             let grad = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: colors, locations: [0, 1])!
             let c = CGPoint(x: px.width/2, y: px.height/2)
@@ -239,7 +273,6 @@ final class HillNode: SKNode {
         return t
     }
     
-    /// Even-odd “donut” with a smooth dark-to-transparent gradient from the outer edge toward the inner edge.
     private static func makeRingAOTexture(outerSize: CGSize, innerSize: CGSize, outerAlpha: CGFloat) -> SKTexture {
         let w = max(2, Int(ceil(outerSize.width)))
         let h = max(2, Int(ceil(outerSize.height)))
@@ -247,7 +280,6 @@ final class HillNode: SKNode {
             let cg = ctx.cgContext
             cg.saveGState()
             
-            // Build even-odd ring path (outer oval minus inner oval)
             let outerR = CGRect(x: 0, y: 0, width: CGFloat(w), height: CGFloat(h))
             let innerR = CGRect(
                 x: (CGFloat(w) - innerSize.width) * 0.5,
@@ -258,9 +290,8 @@ final class HillNode: SKNode {
             let ring = UIBezierPath(ovalIn: outerR)
             ring.append(UIBezierPath(ovalIn: innerR))
             ring.usesEvenOddFillRule = true
-            ring.addClip() // clip drawing to the ring
+            ring.addClip()
             
-            // Radial gradient: darker at the very outside → transparent near the inner edge
             let colors = [UIColor(white: 0, alpha: outerAlpha).cgColor,
                           UIColor(white: 0, alpha: 0.0).cgColor] as CFArray
             let grad = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: colors, locations: [0, 1])!

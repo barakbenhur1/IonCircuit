@@ -15,6 +15,7 @@
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				Core/Untitled.swift,
+				Info.plist,
 			);
 			target = 4F350CC12E9BAEA80008DA0E /* IonCircuit */;
 		};
@@ -269,6 +270,8 @@
 				DEVELOPMENT_TEAM = D6DN86P8S8;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = IonCircuit/Info.plist;
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Used to connect the RL trainer running on my Mac during development.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -302,6 +305,8 @@
 				DEVELOPMENT_TEAM = D6DN86P8S8;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = IonCircuit/Info.plist;
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Used to connect the RL trainer running on my Mac during development.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;

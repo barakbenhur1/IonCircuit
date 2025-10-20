@@ -28,10 +28,10 @@ final class RampNode: SKNode {
         let w = size.width
         let h = size.height
         let p = CGMutablePath()
-        p.move(to: CGPoint(x: -w/2, y: -h/2))
-        p.addLine(to: CGPoint(x:  w/2, y: -h/2))
-        p.addLine(to: CGPoint(x:  0.0, y:  h/2))
-        p.closeSubpath()
+        // Rounded rectangle centered at (0,0) with corner radius 10
+        let rect = CGRect(x: -w/2, y: -h/2, width: w, height: h)
+        p.addRoundedRect(in: rect, cornerWidth: 10, cornerHeight: 10)
+        // p.closeSubpath() // optional; roundedRect is already closed
         self.rampPath = p
 
         super.init()
@@ -49,13 +49,16 @@ final class RampNode: SKNode {
     // MARK: - UI
     private func buildUI() {
         // Drop shadow
-        let sh = SKShapeNode(path: rampPath)
-        sh.fillColor = .black
-        sh.strokeColor = .clear
-        sh.alpha = 0.25
-        sh.position = CGPoint(x: 0, y: -8)
-        sh.zPosition = -1
-        addChild(sh)
+        let shadow = Self.projectedShadowNode(
+            for: rampPath,
+            light: CGVector(dx: -0.45, dy: 0.9),                   // light coming from top-left
+            length: max(36, rampSize.height * 0.70),               // how far the shadow is cast
+            scaleY: 0.26,                                           // flatten the shadow
+            alpha: 0.32,                                            // darkness
+            softness: 10                                            // blur radius
+        )
+        shadow.zPosition = -2
+        addChild(shadow)
 
         // Beveled fill via gradient sprite
         let tex = Self.makeLinearGradient(size: rampSize,
@@ -101,6 +104,47 @@ final class RampNode: SKNode {
             chevNode.addChild(s)
         }
         addChild(chevNode)
+    }
+    
+    private static func projectedShadowNode(for path: CGPath,
+                                            light: CGVector,
+                                            length: CGFloat,
+                                            scaleY: CGFloat,
+                                            alpha: CGFloat,
+                                            softness: CGFloat) -> SKNode {
+        // Normalize light direction
+        let mag = max(0.001, hypot(light.dx, light.dy))
+        let nx = light.dx / mag
+        let ny = light.dy / mag
+
+        // Shear factor: emulate perspective skew along X based on light angle
+        // Clamp to keep it stable for steep angles
+        let shearX = max(-1.0, min(1.0, (-nx / max(0.1, ny)) * 0.6))
+
+        // Build combined transform: scale (flatten) -> shear -> translate (cast away from light)
+        let S  = CGAffineTransform(scaleX: 1.0, y: scaleY)
+        let Sh = CGAffineTransform(a: 1, b: 0, c: shearX, d: 1, tx: 0, ty: 0)
+        let T  = CGAffineTransform(translationX: -nx * length, y: -ny * length)
+        var combined = S.concatenating(Sh).concatenating(T)
+
+        guard let castPath = path.copy(using: &combined) else { return SKNode() }
+
+        // Solid filled shadow
+        let fill = SKShapeNode(path: castPath)
+        fill.fillColor = .black
+        fill.strokeColor = .clear
+        fill.alpha = alpha
+        fill.blendMode = .alpha
+
+        // Blur it a bit for softness
+        let effect = SKEffectNode()
+        effect.shouldRasterize = true
+        if let f = CIFilter(name: "CIGaussianBlur") {
+            f.setValue(softness, forKey: kCIInputRadiusKey)
+            effect.filter = f
+        }
+        effect.addChild(fill)
+        return effect
     }
 
     // MARK: - Physics

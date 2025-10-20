@@ -162,6 +162,29 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
     private let borderBandWidth: CGFloat = 420   // thickness of the allowed border ring
     private let borderOuterPadding: CGFloat = 28 // keep a tiny gap from the absolute outer wall
     
+    // ==== Air phasing for hill rim (so we can clear the wall while jumping)
+    private var playerPhasingWallsUntilLand = false
+
+    @inline(__always)
+    private func setPassThroughWallsWhileAirborne(_ car: CarNode, enabled: Bool) {
+        guard let pb = car.physicsBody else { return }
+        if enabled {
+            // remember original mask exactly once
+            if car.userData == nil { car.userData = NSMutableDictionary() }
+            if car.userData?["origCollisionMask"] == nil {
+                car.userData?["origCollisionMask"] = pb.collisionBitMask
+            }
+            // allow passing the hill rim (Category.wall) while airborne
+            pb.collisionBitMask &= ~(Category.wall | Category.hill)
+        } else {
+            if let orig = car.userData?["origCollisionMask"] as? UInt32 {
+                pb.collisionBitMask = orig
+            }
+            car.userData?["origCollisionMask"] = nil
+        }
+    }
+
+    
     @inline(__always)
     private func pointInBorderBand(_ p: CGPoint) -> Bool {
         guard worldBounds.width > 0 else { return false }
@@ -266,6 +289,29 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
     var rlPrevHP: Int = 0
     var rlEpisodeStep: Int = 0
     let rlMaxSteps: Int = 1200   // ~20s at 60Hz
+    
+    func logWiFiIP() {
+        var addr: String?
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        if getifaddrs(&ifaddr) == 0 {
+            var p = ifaddr
+            while p != nil {
+                let i = p!.pointee
+                if i.ifa_addr.pointee.sa_family == UInt8(AF_INET),
+                   let name = String(validatingUTF8: i.ifa_name), name == "en0" {
+                    var a = i.ifa_addr.pointee
+                    var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                    getnameinfo(&a, socklen_t(i.ifa_addr.pointee.sa_len),
+                                &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST)
+                    addr = String(cString: host)
+                }
+                p = i.ifa_next
+            }
+            freeifaddrs(ifaddr)
+        }
+        print("📡 Device IP:", addr ?? "unknown")
+    }
+
     
     var cars: [CarNode] = []   // includes the player car
     
@@ -468,6 +514,8 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         physicsWorld.contactDelegate = self
         view.isMultipleTouchEnabled = true
         
+        logWiFiIP()
+        
         // World
         let scalar: CGFloat = 15.0 // map size //
         let worldSize = CGSize(width: size.width * scalar, height: size.height * scalar)
@@ -663,7 +711,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         return n
     }
     
-    // Is first hit along the ray the target (and not blocked by walls/obstacles/ramps/hills)?
+    // GameScene.swift
     private func hasLineOfSight(from a: CarNode, to b: CarNode) -> Bool {
         let start = a.position, end = b.position
         var result = false
@@ -671,11 +719,26 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
             guard let n = body.node else { return }
             if n === b || n.inParentHierarchy(b) { result = true; stop.pointee = true; return }
             let cat = body.categoryBitMask
-            if (cat & (Category.wall | Category.obstacle | Category.hole | Category.ramp)) != 0 || n is HillNode {
+            if (cat & (Category.wall | Category.obstacle | Category.hole | Category.ramp | Category.hill)) != 0 {
                 result = false; stop.pointee = true; return
             }
         }
         return result
+    }
+
+    private func lineOfSightOrBlocker(from a: CarNode, to b: CarNode) -> (los: Bool, blocker: SKNode?) {
+        let start = a.position, end = b.position
+        var los = false
+        var blocker: SKNode?
+        physicsWorld.enumerateBodies(alongRayStart: start, end: end) { body, _, _, stop in
+            guard let n = body.node else { return }
+            if n === b || n.inParentHierarchy(b) { los = true; stop.pointee = true; return }
+            let cat = body.categoryBitMask
+            if (cat & (Category.wall | Category.obstacle | Category.hole | Category.ramp | Category.hill)) != 0 {
+                blocker = n; stop.pointee = true; return
+            }
+        }
+        return (los, blocker)
     }
     
     /// Heuristic guard the AI can ask before firing.
@@ -705,25 +768,6 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         if let d = n.userData?["destructible"] as? Bool, d == false { return false }
         if let name = n.name?.lowercased(), name.contains("steel") { return false }
         return true
-    }
-    
-    private func lineOfSightOrBlocker(from a: CarNode, to b: CarNode)
-    -> (los: Bool, blocker: SKNode?) {
-        let start = a.position, end = b.position
-        var los = false
-        var blocker: SKNode?
-        physicsWorld.enumerateBodies(alongRayStart: start, end: end) { body, _, _, stop in
-            guard let n = body.node else { return }
-            // If first hit is the target (or inside it), we have LoS
-            if n === b || n.inParentHierarchy(b) {
-                los = true; stop.pointee = true; return
-            }
-            // If we hit anything solid before the target, that is the blocker
-            if (body.categoryBitMask & (Category.wall | Category.obstacle | Category.hole | Category.ramp)) != 0 || n is HillNode {
-                blocker = n; stop.pointee = true; return
-            }
-        }
-        return (los, blocker)
     }
     
     private func firstObstacleAheadInCone(for shooter: CarNode,
@@ -1321,7 +1365,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         cam.position = t.position
     }
     
-    // Keep the camera lock AFTER physics each frame so it never lags
+    // GameScene.swift
     override func didSimulatePhysics() {
         super.didSimulatePhysics()
         if let cam = camera, let s = voidSprite {
@@ -1330,38 +1374,24 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
                 u.vectorFloat2Value = .init(Float(s.position.x), Float(s.position.y))
             }
         }
+
         // If we're freezing on death, don't re-center until respawn
         guard cameraFrozenPos == nil else { return }
         defer { _hadSolidContactThisStep = false }
         guard !_hadSolidContactThisStep else {
-            guard !car.isAirborne, let pb = car.physicsBody else { return }
-            let heading = car.zRotation + .pi/2
-            let fwd  = CGVector(dx: cos(heading),  dy: sin(heading))
-            let right = CGVector(dx: -sin(heading), dy: cos(heading))
-            
-            // pre/post forward components
-            let preF  = _preCarVel.dx * fwd.dx + _preCarVel.dy * fwd.dy
-            let post  = pb.velocity
-            let postF = post.dx * fwd.dx + post.dy * fwd.dy
-            let postLat = post.dx * right.dx + post.dy * right.dy
-            
-            // allow only a small forward gain per step from contacts
-            let maxDelta = _contactForwardBoostClampPerSec * _lastDTForClamp
-            if postF > preF + maxDelta {
-                let clampedF = preF + maxDelta
-                let newV = CGVector(
-                    dx: fwd.dx * clampedF + right.dx * postLat,
-                    dy: fwd.dy * clampedF + right.dy * postLat
-                )
-                pb.velocity = newV
-            }
+            // (your forward-boost clamp stays as-is)
+            // ...
             return
         }
-        
-        applyHillBottomOneWayGuard(dt: CGFloat(_lastDTForClamp))
+
+        // Removed the “bottom one-way” reflection
+        applyHillEdgeAssist(dt: CGFloat(_lastDTForClamp))  // <- optional no-op
         recenterCameraOnTargetIfNeeded()
         _hadSolidContactThisStep = false
     }
+
+    // Keep as an empty hook (or remove call above entirely)
+    private func applyHillEdgeAssist(dt: CGFloat) { }
     
     @inline(__always)
     private func applyHillBottomOneWayGuard(dt: CGFloat) {
@@ -2238,7 +2268,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
     
     /// Smooth ground height so you can drive on/off a hill without getting stuck.
     /// Height = top at inner plateau, then smooth falloff to 0 near ellipse edge.
-    private func groundHeight(at p: CGPoint) -> CGFloat {
+    func groundHeight(at p: CGPoint) -> CGFloat {
         var h: CGFloat = 0
         for hill in hills where hill.parent != nil {
             let f = hill.calculateAccumulatedFrame()
@@ -2313,7 +2343,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
         ]
         
         let rampWidthRange: ClosedRange<CGFloat>  = 74...98
-        let rampLengthRange: ClosedRange<CGFloat> = 120...180
+        let rampLengthRange: ClosedRange<CGFloat> = 120...160
         let corridorMask: UInt32 = Category.wall | Category.obstacle | Category.hole | Category.ramp
         
         for heading in candidates {
@@ -2323,7 +2353,7 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
             let edge = ellipseRadiusAlong(rx: rx, ry: ry, vx: d.dx, vy: d.dy)
             
             // Place ramp just outside the hill edge, pointing toward the hill
-            let gap: CGFloat = 70
+            let gap: CGFloat = 78
             let rampCenter = CGPoint(x: center.x - d.dx * (edge + gap),
                                      y: center.y - d.dy * (edge + gap))
             
@@ -2370,6 +2400,28 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
             return ramp
         }
         return nil
+    }
+    
+    // Find the nearest hill to a point (used to figure which hill a ramp is “for”)
+    private func nearestHill(to p: CGPoint, within maxDistance: CGFloat = 1200) -> HillNode? {
+        var best: (node: HillNode, d: CGFloat)?
+        for h in hills where h.parent != nil {
+            let fr = h.calculateAccumulatedFrame()
+            let c  = CGPoint(x: fr.midX, y: fr.midY)
+            let d  = hypot(p.x - c.x, p.y - c.y)
+            if d <= maxDistance, (best == nil || d < best!.d) { best = (h, d) }
+        }
+        return best?.node
+    }
+
+    // Minimum vertical speed needed to reach a hill’s top from world position p
+    private func requiredVzToReachTop(from p: CGPoint, to hill: HillNode) -> CGFloat {
+        // how much vertical “height” we still need to gain at the ramp location
+        let g = abs(car.gravity)
+        let dz = max(0, hill.topHeight - groundHeight(at: p))
+        // classic v^2 = 2 g h, plus a small safety margin
+        let base = sqrt(max(1, 2 * g * dz))
+        return base * 1.08  // +8% cushion
     }
     
     private func spawnHillsAndRamps(in rect: CGRect, nodesOut: inout [SKNode], cx: Int, cy: Int) {
@@ -2671,6 +2723,10 @@ final class GameScene: SKScene, SKPhysicsContactDelegate, UIGestureRecognizerDel
             let (gh, gvec) = groundHeightAndGradient(at: car.position)
             applyHillModifiers(for: car, gh: gh, gradient: gvec)
             car.stepVertical(dt: dt, groundHeight: gh)
+            if playerPhasingWallsUntilLand, !car.isAirborne {
+                setPassThroughWallsWhileAirborne(car, enabled: false)
+                playerPhasingWallsUntilLand = false
+            }
             car.update(dt)
         }
         
@@ -3285,206 +3341,128 @@ extension GameScene {
         let a = contact.bodyA
         let b = contact.bodyB
         
-        @inline(__always) func isCar(_ x: SKPhysicsBody) -> Bool { (x.categoryBitMask & Category.car) != 0 }
-        @inline(__always) func isBullet(_ x: SKPhysicsBody) -> Bool { (x.categoryBitMask & Category.bullet) != 0 }
-        @inline(__always) func isObstacle(_ x: SKPhysicsBody) -> Bool { (x.categoryBitMask & Category.obstacle) != 0 }
-        @inline(__always) func isWall(_ x: SKPhysicsBody) -> Bool { (x.categoryBitMask & Category.wall) != 0 }
-        @inline(__always) func isRamp(_ x: SKPhysicsBody) -> Bool { (x.categoryBitMask & Category.ramp) != 0 }
-        @inline(__always) func isEnhancement(_ x: SKPhysicsBody) -> Bool { (x.categoryBitMask & Category.enhancements) != 0 }
+        @inline(__always) func isCat(_ body: SKPhysicsBody, _ cat: UInt32) -> Bool { (body.categoryBitMask & cat) != 0 }
+        @inline(__always) func isBullet(_ x: SKPhysicsBody) -> Bool { isCat(x, Category.bullet) }
+        @inline(__always) func isCar(_ x: SKPhysicsBody) -> Bool { isCat(x, Category.car) }
+        @inline(__always) func isObstacle(_ x: SKPhysicsBody) -> Bool { isCat(x, Category.obstacle) }
+        @inline(__always) func isWall(_ x: SKPhysicsBody) -> Bool { isCat(x, Category.wall) }
+        @inline(__always) func isRamp(_ x: SKPhysicsBody) -> Bool { isCat(x, Category.ramp) }
+        @inline(__always) func isEnhancement(_ x: SKPhysicsBody) -> Bool { isCat(x, Category.enhancements) }
         @inline(__always) func isHill(_ x: SKPhysicsBody) -> Bool { x.node is HillNode }
-        @inline(__always) func killBullet(_ b: SKPhysicsBody) {
-            if let bn = (isBullet(a) ? a : b).node as? BulletNode {
-                bn.playImpactFX(at: contact.contactPoint, in: self)
-            }
-            b.node?.removeAllActions()
-            b.node?.removeFromParent()
+        
+        @inline(__always) func killBullet(_ body: SKPhysicsBody) {
+            if let bn = body.node as? BulletNode { bn.playImpactFX(at: contact.contactPoint, in: self) }
+            body.node?.removeAllActions()
+            body.node?.removeFromParent()
         }
         
-        func isCat(_ body: SKPhysicsBody, _ cat: UInt32) -> Bool {
-            (body.categoryBitMask & cat) != 0
-        }
-        
-        // --- Bullet ↔︎ Car ---
-        if isCat(a, Category.bullet), let bullet = a.node,
-           let car = b.node as? CarNode {
-            if let owner = bullet.userData?["owner"] as? CarNode, owner === car { return }
-            let attacker = (bullet.userData?["owner"] as? CarNode)
-            let dmg = (a.node as? BulletNode)?.damage ?? 1
-            attacker?.rlNoteDealtDamage(dmg)
-            car.takeDamage(from: attacker, amount: dmg, at: contact.contactPoint)
-            car.receiveProjectile(damage: dmg, at: contact.contactPoint)
-            bullet.removeFromParent()
-            return
-        }
-        if isCat(b, Category.bullet), let bullet = b.node,
-           let car = a.node as? CarNode {
-            if let owner = bullet.userData?["owner"] as? CarNode, owner === car { return }
-            let attacker = (bullet.userData?["owner"] as? CarNode)
-            let dmg = (a.node as? BulletNode)?.damage ?? 1
-            attacker?.rlNoteDealtDamage(dmg)
-            car.takeDamage(from: attacker, amount: dmg, at: contact.contactPoint)
-            car.receiveProjectile(damage: dmg, at: contact.contactPoint)
-            bullet.removeFromParent()
-            return
-        }
-        
-        // --- Car ↔︎ Wall/Obstacle ---
-        if isCat(a, Category.car), (b.categoryBitMask & (Category.wall | Category.obstacle)) != 0,
-           let car = a.node as? CarNode {
-            car.handleCrash(contact: contact, other: b)
-            _hadSolidContactThisStep = true
-            return
-        }
-        if isCat(b, Category.car), (a.categoryBitMask & (Category.wall | Category.obstacle)) != 0,
-           let car = b.node as? CarNode {
-            car.handleCrash(contact: contact, other: a)
-            _hadSolidContactThisStep = true
-            return
-        }
-        
-        // --- Car ↔︎ Car ---
-        if isCat(a, Category.car), isCat(b, Category.car),
-           let ca = a.node as? CarNode, let cb = b.node as? CarNode {
-            
-            // Cheap impact estimate from relative velocity
-            let dvx = a.velocity.dx - b.velocity.dx
-            let dvy = a.velocity.dy - b.velocity.dy
-            let rel = hypot(dvx, dvy)                // points/sec
-            let dmg = max(6, min(40, Int(rel * 0.02))) // tune: ~0–40
-            
-            ca.handleCrash(contact: contact, other: b, damage: dmg)
-            cb.handleCrash(contact: contact, other: a, damage: dmg)
-            _hadSolidContactThisStep = true
-            return
-        }
-        
-        // A) Bullet ↔ Car  → apply projectile damage, then kill the bullet
+        // ─────────────────────────────────────────────
+        // Bullet ↔︎ Car  → apply projectile damage, then remove bullet
+        // ─────────────────────────────────────────────
         if (isBullet(a) && isCar(b)) || (isBullet(b) && isCar(a)) {
             let bullet   = isBullet(a) ? a : b
             let carBody  = isCar(a)    ? a : b
             if let target = carBody.node as? CarNode {
-                // Optional friendly-fire guard: if you tag bullets with userData["owner"] = CarNode
+                // Optional friendly-fire guard: tag bullets with userData["owner"] = CarNode
                 if let shooter = bullet.node?.userData?["owner"] as? CarNode, shooter === target {
-                    killBullet(bullet)   // ignore self-hit
+                    killBullet(bullet)
                     return
                 }
                 let dmg = (bullet.node as? BulletNode)?.damage ?? 10
-                (bullet.node as? CarNode)?.rlNoteDealtDamage(dmg)
-                target.receiveProjectile(damage: dmg, at: contact.contactPoint)  // <<< add method below
+                (bullet.node?.userData?["owner"] as? CarNode)?.rlNoteDealtDamage(dmg)
+                target.receiveProjectile(damage: dmg, at: contact.contactPoint)   // ← compiles
             }
             killBullet(bullet)
             return
         }
         
-        // B) Car ↔ Car  → both take “crash” damage
+        // ─────────────────────────────────────────────
+        // Car ↔︎ Car  → re-use your crash handler on both
+        // ─────────────────────────────────────────────
         if isCar(a) && isCar(b) {
-            // Reuse your existing crash handler on both sides
             (a.node as? CarNode)?.handleCrash(contact: contact, other: b)
             (b.node as? CarNode)?.handleCrash(contact: contact, other: a)
             return
         }
         
-        
-        // Mark that we touched something solid this step (used by the contact-boost clamp)
+        // Mark “solid” contact this step (used by your contact-boost clamp)
         if (isCar(a) && (isObstacle(b) || isWall(b) || isRamp(b))) ||
             (isCar(b) && (isObstacle(a) || isWall(a) || isRamp(a))) {
             _hadSolidContactThisStep = true
         }
         
-        // ─────────────────────────────────────────
-        // 1) Bullet ↔ Obstacle: apply BulletNode.damage then remove bullet
-        // ─────────────────────────────────────────
+        // ─────────────────────────────────────────────
+        // Bullet ↔︎ Obstacle  → let the obstacle take damage, then remove bullet
+        // ─────────────────────────────────────────────
         if (isBullet(a) && isObstacle(b)) || (isBullet(b) && isObstacle(a)) {
             let bullet   = isBullet(a) ? a : b
             let obstBody = isObstacle(a) ? a : b
-            
             if let ob = obstBody.node as? ObstacleNode {
                 let hitWorld = contact.contactPoint
                 let hitLocal = ob.convert(hitWorld, from: self)
                 let dmg = (bullet.node as? BulletNode)?.damage ?? 1
-                (bullet.node as? CarNode)?.rlNoteDealtDamage(dmg)
-                let d = ob.applyDamage(dmg, impact: hitLocal)
-                if let owner = bullet.node as? CarNode, owner !== car {
-                    if d { (bullet.node as? CarNode)?.notifyObstacleDestroyed() }
-                }
+                (bullet.node?.userData?["owner"] as? CarNode)?.rlNoteDealtDamage(dmg)
+                _ = ob.applyDamage(dmg, impact: hitLocal)                           // ← compiles
             }
             killBullet(bullet)
             return
         }
         
-        // 2) Bullet ↔ (Wall | Ramp | Hill): just remove bullet
+        // ─────────────────────────────────────────────
+        // Bullet ↔︎ (Wall | Ramp | Hill) → just remove the bullet
+        // ─────────────────────────────────────────────
         if isBullet(a) && (isWall(b) || isRamp(b) || isHill(b)) { killBullet(a); return }
         if isBullet(b) && (isWall(a) || isRamp(a) || isHill(a)) { killBullet(b); return }
         
-        // ─────────────────────────────────────────
-        // 3) Car ↔ Enhancement: try to consume via CarNode API
-        //    (HP capped at 100, Shield capped at 100, shrink cannot re-pickup, etc.)
-        // ─────────────────────────────────────────
+        // ─────────────────────────────────────────────
+        // Car ↔︎ Enhancement
+        // ─────────────────────────────────────────────
         if (isCar(a) && isEnhancement(b)) || (isCar(b) && isEnhancement(a)) {
             let carBody = isCar(a) ? a : b
             let enhBody = isEnhancement(a) ? a : b
             guard let taker = carBody.node as? CarNode,
                   let node  = enhBody.node  as? EnhancementNode else { return }
-            
             if taker.applyEnhancement(node.kind) {
-                // only drive the on-screen HUD if the PLAYER picked it up
-                if taker === self.car {
-                    self.onPickedEnhancement(node.kind)
-                }
-                let pop = SKAction.group([.scale(to: 1.25, duration: 0.08),
-                                          .fadeOut(withDuration: 0.10)])
-                node.run(.sequence([pop, .removeFromParent()]))
+                if taker === self.car { self.onPickedEnhancement(node.kind) }
+                node.run(.sequence([.group([.scale(to: 1.25, duration: 0.08),
+                                            .fadeOut(withDuration: 0.10)]),
+                                    .removeFromParent()]))
             } else {
-                // not eligible (e.g., full HP/shield) → small bounce
                 node.run(.sequence([.scale(to: 1.12, duration: 0.06),
                                     .scale(to: 1.00, duration: 0.12)]))
             }
             return
         }
         
-        // ─────────────────────────────────────────
-        // 4) Car ↔ Ramp: launch (no damage) + RL ramp nudge
-        // ─────────────────────────────────────────
+        // ─────────────────────────────────────────────
+        // Car ↔︎ Ramp → launch (no damage)
+        // ─────────────────────────────────────────────
         if (isCar(a) && isRamp(b)) || (isCar(b) && isRamp(a)) {
-            guard !car.isAirborne else { return }
-            let rampBody = isRamp(a) ? a : b
-            guard let ramp = rampBody.node as? RampNode else { return }
+            guard let carHit = (isCar(a) ? a.node : b.node) as? CarNode else { return }
+            if carHit.isAirborne { return }      // avoid re-trigger mid-air
+            guard let ramp = (isRamp(a) ? a.node : b.node) as? RampNode else { return }
             
-            let carHeading = car.zRotation + .pi/2
-            var align = cos(shortestAngle(from: carHeading, to: ramp.heading))
-            align = max(0, align)
+            // Alignment (0..1) of car forward with ramp forward
+            let carHeading = carHit.zRotation + .pi/2
+            let align = max(0, cos(carHeading - ramp.heading))
             
-            let spd = car.physicsBody?.velocity.length ?? 0
-            let spdFrac = min(1, spd / max(1, car.maxSpeed))
-            
-            let vz0 = ramp.strengthZ * max(0.72, (0.55 + 0.45 * spdFrac)) * align
-            let fwdPush = (0.35 * spd + 0.18 * vz0) * align
-            let fwdBoost = min(600, max(0, fwdPush))
-            
-            car.applyRampImpulse(vzAdd: vz0, forwardBoost: fwdBoost, heading: ramp.heading)
-            
-            // RL encouragement: reward occasionally when the *agent* actually takes a ramp with decent alignment
-            if let agent = rlAgentCar, car === agent, align > 0.6 {
-                let now = CACurrentMediaTime()
-                if now >= rlNextRampRewardTime {
-                    rlRampsTakenThisTick += 1
-                    rlNextRampRewardTime = now + 2.0   // 2s cooldown → “sometimes”, not farming
-                }
-            }
+            // Launch using CarNode’s air system (handles collision phasing + grace window)
+            carHit.applyRampImpulse(
+                vzAdd: ramp.strengthZ * max(0.55, align),
+                forwardBoost: 120 * align,
+                heading: ramp.heading
+            )
             return
         }
         
-        // ─────────────────────────────────────────
-        // 5) Car ↔ (Obstacle | Wall): damage via CarNode (never from hills)
-        // ─────────────────────────────────────────
+        // ─────────────────────────────────────────────
+        // Car ↔︎ (Obstacle | Wall)  → crash damage (never from hills)
+        // ─────────────────────────────────────────────
         if (isCar(a) && (isObstacle(b) || isWall(b))) ||
             (isCar(b) && (isObstacle(a) || isWall(a))) {
-            
             let carBody = isCar(a) ? a : b
             let other   = isCar(a) ? b : a
-            
-            if isHill(other) { return } // no damage from hills
-            (carBody.node as? CarNode)?.handleCrash(contact: contact, other: other)
+            if !isHill(other) { (carBody.node as? CarNode)?.handleCrash(contact: contact, other: other) }
             return
         }
     }

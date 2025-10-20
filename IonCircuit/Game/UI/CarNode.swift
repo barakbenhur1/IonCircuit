@@ -54,7 +54,21 @@ final class CarNode: SKNode {
         static var wpn:    UInt8 = 0
         static var ctrlOn: UInt8 = 0
         static var miniOn: UInt8 = 0
+        static var airMask: UInt8 = 0
     }
+    
+    var _airMask: UInt32 {
+        get { objc_getAssociatedObject(self, &Assoc.airMask) as? UInt32 ?? 0 }
+        set { objc_setAssociatedObject(self, &Assoc.airMask, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
+    }
+    
+    // How far above the car the HUD sits
+    var hudYOffset: CGFloat = 32 {
+        didSet { if miniHUD.parent != nil { miniHUD.position.y = hudYOffset } }
+    }
+
+    // If true → keep HUD upright to screen. If false → HUD rotates with car.
+    var hudKeepsScreenUpright: Bool = false
     
     // ---- Tuning ----
     var acceleration: CGFloat = 1240.0
@@ -155,10 +169,10 @@ final class CarNode: SKNode {
     
     private func installMiniUIIfNeeded() {
         guard miniHUD.parent == nil else { return }
-        // Keep the chip just above the car and centered
         miniHUD.zPosition = 150
-        miniHUD.position = CGPoint(x: 0, y: 48)   // centered above car
+        miniHUD.position = CGPoint(x: 0, y: hudYOffset)
         addChild(miniHUD)
+        syncMiniHUDTransform()
         
         // Background capsule
         let backRect = CGRect(x: -MiniUI.hpW/2, y: 0, width: MiniUI.hpW, height: MiniUI.hpH)
@@ -183,8 +197,7 @@ final class CarNode: SKNode {
         
         // Lives row above the bar
         miniHUD.addChild(miniLivesNode)
-        miniLivesNode.position = CGPoint(x: 0, y: MiniUI.hpH + 8)
-        
+        miniLivesNode.position = CGPoint(x: 0, y: MiniUI.hpH + 8)  // was +8 → closer to bar
         refreshMiniHUD()
     }
     
@@ -231,6 +244,11 @@ final class CarNode: SKNode {
                    control2: CGPoint(x: 0.6*r, y: -1.4*r))
         p.closeSubpath()
         return p
+    }
+    
+    private func syncMiniHUDTransform() {
+        miniHUD.position.y = hudYOffset
+        miniHUD.zRotation = hudKeepsScreenUpright ? -zRotation : 0   // 0 = inherit car’s rotation
     }
     
     // MARK: lives callback (wrap to also refresh mini HUD)
@@ -455,13 +473,13 @@ final class CarNode: SKNode {
 
 // Keep the chip synced & upright
 extension CarNode {
+    // stays as-is
     func refreshMiniHUD() {
         miniHUD.isHidden = isHidden || isDead
         refreshMiniHP()
         refreshMiniShield()
         layoutMiniHearts()
-        // Counter-rotate so the bar stays horizontal on screen
-        miniHUD.zRotation = -zRotation
+        syncMiniHUDTransform()
     }
 }
 
@@ -591,184 +609,10 @@ extension CarNode {
 
 // MARK: - Air / Verticality
 extension CarNode {
-    private struct LandAssoc { static var t = 0 }
-    private var _lastLandingT: TimeInterval {
-        get { (objc_getAssociatedObject(self, &LandAssoc.t) as? TimeInterval) ?? 0 }
-        set { objc_setAssociatedObject(self, &LandAssoc.t, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
-    }
-    
-    private struct LifeAssoc { static var max = 0, left = 0 }
-    var maxLives: Int {
-        get { (objc_getAssociatedObject(self, &LifeAssoc.max) as? Int) ?? 3 }
-        set {
-            let v = max(1, newValue)
-            objc_setAssociatedObject(self, &LifeAssoc.max, v, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
-            if livesLeft > v { livesLeft = v }
-            onLivesChanged?(livesLeft, v)
-        }
-    }
-    
-    var livesLeft: Int {
-        get { (objc_getAssociatedObject(self, &LifeAssoc.left) as? Int) ?? 3 }
-        set {
-            let v = max(0, newValue)
-            objc_setAssociatedObject(self, &LifeAssoc.left, v, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
-            onLivesChanged?(v, maxLives)
-        }
-    }
-    
     func resetLives(_ to: Int? = nil) {
         maxLives = to ?? maxLives
         livesLeft = maxLives
         onLivesChanged?(livesLeft, maxLives)
-    }
-    
-    struct GhostAssoc { static var g = 0 }
-    
-    var _airGhosting: Bool {
-        get { (objc_getAssociatedObject(self, &GhostAssoc.g) as? Bool) ?? false }
-        set { objc_setAssociatedObject(self, &GhostAssoc.g, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
-    }
-    
-    var gravity: CGFloat {
-        get { objc_getAssociatedObject(self, &Assoc.g) as? CGFloat ?? -1800 }
-        set { objc_setAssociatedObject(self, &Assoc.g, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
-    }
-    var zLift: CGFloat {
-        get { objc_getAssociatedObject(self, &Assoc.z) as? CGFloat ?? 0 }
-        set { objc_setAssociatedObject(self, &Assoc.z, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
-    }
-    var vz: CGFloat {
-        get { objc_getAssociatedObject(self, &Assoc.v) as? CGFloat ?? 0 }
-        set { objc_setAssociatedObject(self, &Assoc.v, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
-    }
-    var isAirborne: Bool {
-        get { objc_getAssociatedObject(self, &Assoc.a) as? Bool ?? false }
-        set { objc_setAssociatedObject(self, &Assoc.a, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
-    }
-    
-    var _groundMask: UInt32 {
-        get { objc_getAssociatedObject(self, &Assoc.m) as? UInt32 ?? (physicsBody?.collisionBitMask ?? 0) }
-        set { objc_setAssociatedObject(self, &Assoc.m, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
-    }
-    
-    var shadowNode: SKShapeNode? {
-        get { objc_getAssociatedObject(self, &Assoc.s) as? SKShapeNode }
-        set { objc_setAssociatedObject(self, &Assoc.s, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
-    }
-    
-    /// Call once after creation
-    func enableAirPhysics() {
-        _groundMask = physicsBody?.collisionBitMask ?? 0
-        let sh = SKShapeNode(ellipseOf: CGSize(width: 44, height: 18))
-        sh.fillColor = .black
-        sh.strokeColor = .clear
-        sh.alpha = 0.35
-        sh.zPosition = -1
-        addChild(sh)
-        shadowNode = sh
-    }
-    
-    func stepVertical(dt: CGFloat, groundHeight: CGFloat) {
-        let wasAir = isAirborne
-        
-        // Integrate vertical
-        vz += gravity * dt
-        zLift += vz * dt
-        
-        var vzAtLanding: CGFloat = 0
-        if zLift <= groundHeight {
-            vzAtLanding = vz
-            zLift = groundHeight
-            if vz < 0 { vz = 0 }
-            isAirborne = false
-        } else {
-            isAirborne = true
-        }
-        
-        // Altitude ghosting with hysteresis
-        let clearance = zLift - groundHeight
-        let ghostOn:  CGFloat = 14
-        let ghostOff: CGFloat = 8
-        if isAirborne {
-            if !_airGhosting, clearance > ghostOn { _airGhosting = true }
-            if  _airGhosting, clearance < ghostOff { _airGhosting = false }
-        } else {
-            _airGhosting = false
-        }
-        if let pb = physicsBody { pb.collisionBitMask = _airGhosting ? 0 : _groundMask }
-        
-        // Landing energy handling
-        if wasAir && !isAirborne, let pb = physicsBody {
-            if groundHeight < 16 {
-                let keep = exp(-dt * 2.0)
-                var v = pb.velocity
-                v.dx *= keep; v.dy *= keep
-                pb.velocity = v
-            } else {
-                let heading = zRotation + .pi/2
-                let f = CGVector(dx: cos(heading),  dy: sin(heading))
-                let s = CGVector(dx: -f.dy,         dy: f.dx)
-                let v  = pb.velocity
-                let vf = v.dx * f.dx + v.dy * f.dy
-                let vs = v.dx * s.dx + v.dy * s.dy
-                
-                let impact = min(1, abs(vzAtLanding) / 1100)
-                
-                var alignDown: CGFloat = 0
-                if let scn = scene as? GameScene {
-                    let g = scn.groundGradient(at: position)   // uphill
-                    var down = CGVector(dx: -g.dx, dy: -g.dy)
-                    let len = max(1e-6, hypot(down.dx, down.dy))
-                    down.dx /= len; down.dy /= len
-                    alignDown = max(0, f.dx * down.dx + f.dy * down.dy)
-                }
-                
-                let baseKeepF: CGFloat = 0.65 - 0.35 * impact
-                let boostF:    CGFloat = 0.35 * alignDown
-                let keepFwd = CGFloat.clamp(baseKeepF + boostF, 0.25, 0.95)
-                let keepSide = max(0.28, 0.50 - 0.30 * impact)
-                
-                let newV = CGVector(
-                    dx: f.dx * (vf * keepFwd) + s.dx * (vs * keepSide),
-                    dy: f.dy * (vf * keepFwd) + s.dy * (vs * keepSide)
-                )
-                pb.velocity = newV
-            }
-            
-            let now = CACurrentMediaTime()
-            if now - _lastLandingT > 0.08 {
-                removeAction(forKey: "landPop")
-                run(.sequence([.scale(to: 1.03, duration: 0.05),
-                               .scale(to: 1.00, duration: 0.08)]), withKey: "landPop")
-                UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                _lastLandingT = now
-            }
-        }
-    }
-    
-    /// `heading` is the ramp forward direction.
-    func applyRampImpulse(vzAdd: CGFloat, forwardBoost: CGFloat, heading: CGFloat) {
-        guard let pb = physicsBody else { return }
-        isAirborne = true
-        vz += vzAdd
-        _airGhosting = true
-        pb.collisionBitMask = 0
-        speedCapBonus = 0
-        
-        let f = CGVector(dx: cos(heading), dy: sin(heading))      // ramp forward
-        let s = CGVector(dx: -f.dy,          dy: f.dx)            // right
-        let v = pb.velocity
-        let vf = v.dx * f.dx + v.dy * f.dy
-        let vs = v.dx * s.dx + v.dy * s.dy
-        
-        let steep = min(1.0, max(0.0, vzAdd / 1100.0))
-        let loss  = min(launchLossMax, 0.12 + 0.32 * steep)
-        let newVf = max(0, vf * (1 - loss)) + forwardBoost
-        let newVs = vs * (1 - loss * 0.25)
-        
-        pb.velocity = CGVector(dx: f.dx * newVf + s.dx * newVs,
-                               dy: f.dy * newVf + s.dy * newVs)
     }
 }
 
@@ -1433,105 +1277,94 @@ func tintCar(_ car: SKNode, to color: UIColor) {
 
 extension CarNode {
     func update(_ dt: CGFloat) {
-        //        stepLearnedPolicyIfAny() // turn on after train of AI
+        // stepLearnedPolicyIfAny() // turn on after training if you want
         guard let pb = physicsBody, dt > 0 else { return }
-        
-        // --- before you change the velocity ---
-        let speed0 = hypot(pb.velocity.dx, pb.velocity.dy)
-        
-        // Heading (forward = +Y)
-        let heading = zRotation + .pi/2
-        let f = CGVector(dx: cos(heading), dy: sin(heading))
-        let r = CGVector(dx: -f.dy, dy: f.dx)
-        
-        let v = pb.velocity
-        let fwd = v.dx * f.dx + v.dy * f.dy
-        let lat = v.dx * r.dx + v.dy * r.dy
-        
-        // Control boost
+
+        // --- cache BEFORE changes ---
+        let v0 = pb.velocity
+        let speed0 = hypot(v0.dx, v0.dy)
+
+        // Control modifiers
         let steerGain = (controlBoostActive ? turnRate * 1.25 : turnRate)
         let tractionK = (controlBoostActive ? traction * 1.25 : traction)
-        
+
+        // --- rotation ---
         if kind == .enemy {
-            // --- AI: NO PIVOT. Turn only when moving forward enough, and smooth yaw. ---
-            // forward direction
-            let heading = zRotation + .pi/2
-            let f = CGVector(dx: cos(heading), dy: sin(heading))
-            
-            // forward speed component (signed -> abs for “how much rolling”)
-            let fwdSpeedAbs = abs(pb.velocity.dx * f.dx + pb.velocity.dy * f.dy)
-            
-            // smooth gate 0→1 between 120..420 pts/s (no rotation when nearly stopped)
+            // No in-place pivot: gate by total speed and clamp yaw accel/speed.
             @inline(__always)
             func smoothstep(_ x: CGFloat, _ e0: CGFloat, _ e1: CGFloat) -> CGFloat {
                 let t = CGFloat.clamp((x - e0) / max(e1 - e0, 1), 0, 1)
                 return t * t * (3 - 2 * t)
             }
-            let gate = smoothstep(fwdSpeedAbs, 120, 420)
-            
-            // steer command (safe range)
-            let steerCmd = CGFloat.clamp(steer, -1, 1)
-            
-            // reduce turning while reversing a bit (optional but helps)
-            let reverseMul: CGFloat = (throttle < -0.05) ? 0.6 : 1.0
-            
-            // target yaw rate is the same scale as player's steerGain, but gated by forward motion
-            let targetYaw = steerCmd * steerGain * gate * reverseMul
-            
-            // smooth toward target and clamp angular accel & max yaw
-            let dv = CGFloat.clamp(targetYaw - yawSpeedAI,
-                                   -maxYawAccelAI * dt,
-                                   +maxYawAccelAI * dt)
-            yawSpeedAI += dv
+
+            let spdAbs = speed0
+            let gate   = smoothstep(spdAbs, 120, 420)
+
+            if spdAbs < 60 {
+                yawSpeedAI = 0
+            } else {
+                let steerCmd = CGFloat.clamp(steer, -1, 1)
+                let reverseMul: CGFloat = (throttle < -0.05) ? 0.6 : 1.0
+                let targetYaw = steerCmd * steerGain * gate * reverseMul
+
+                let dv = CGFloat.clamp(targetYaw - yawSpeedAI,
+                                       -maxYawAccelAI * dt,
+                                       +maxYawAccelAI * dt)
+                yawSpeedAI += dv
+            }
+
             let yaw = CGFloat.clamp(yawSpeedAI, -maxYawSpeedAI, +maxYawSpeedAI)
-            
-            // hard-zero any residual drift when basically stopped
-            if fwdSpeedAbs < 60 { yawSpeedAI = 0 }
-            
             zRotation += yaw * dt
         } else {
-            // --- Player: keep your good, snappy controls exactly as-is ---
+            // Player: keep snappy steer
             zRotation += steer * steerGain * dt
         }
-        
-        // Caps
+
+        // --- recompute axes AFTER rotation ---
+        let heading = zRotation + .pi/2
+        let f = CGVector(dx: cos(heading), dy: sin(heading))
+        let r = CGVector(dx: -f.dy, dy: f.dx)
+
+        // Decompose old velocity on new axes
+        let fwd = v0.dx * f.dx + v0.dy * f.dy
+        let lat = v0.dx * r.dx + v0.dy * r.dy
+
+        // --- speed caps ---
         let capFwd = (maxSpeed + speedCapBonus) * hillSpeedMul
         let capRev = -capFwd * reverseSpeedFactor
-        
-        // Throttle → forward accel
+
+        // --- throttle & damping ---
         let accel  = acceleration * hillAccelMul
         let df     = accel * throttle * dt
         var newFwd = CGFloat.clamp(fwd + df, capRev, capFwd)
-        
-        // Drag & lateral bleed
+
         let keepLat = CGFloat(exp(-Double(tractionK * dt)))
         let newLat  = lat * keepLat
-        
-        // Extra hill drag
+
         let extraD  = max(0, 1 - hillDragK * dt * 0.002)
         newFwd     *= extraD
-        
+
         let vNew = CGVector(dx: f.dx * newFwd + r.dx * newLat,
                             dy: f.dy * newFwd + r.dy * newLat)
         pb.velocity = vNew
-        
-        // --- brake light logic: speed drop (not signed forward change) ---
+
+        // --- lights ---
         let speed1 = hypot(vNew.dx, vNew.dy)
         let decel  = (speed0 - speed1) > 25 * dt
         let fast   = speed0 > 30
         let reverseCommand = (throttle < -0.1)
         let braking = reverseCommand || ((throttle <= 0.2) && decel && fast)
-        
         tailL.alpha = braking || speed1 < 30 ? 1.0 : 0.2
         tailR.alpha = tailL.alpha
-        
-        // Exhaust + miniHUD
+
+        // --- VFX & HUD ---
         updateExhaust(speed: speed1, fwdMag: newFwd, dt: dt)
-        miniHUD.zRotation = -zRotation
-        
+        syncMiniHUDTransform()
+
+        // --- RL reverse penalty bookkeeping ---
         updateReversePenalty(dt: dt)
     }
-    
+
     public func consumeWallPenalty() -> Double {
         if _bumpedWallThisStep {
             _bumpedWallThisStep = false
@@ -1728,11 +1561,9 @@ final class RLServer {
     }
     
     // MARK: - One control/step/reward cycle
-    // RLServer ---------------------------------------------
     private func stepOnce(throttle: CGFloat, steer: CGFloat, fire: Bool) async -> WireResp {
         guard let scene, let agent, let target else { return WireResp(obs: [], reward: 0, done: true) }
-        
-        // small helper (local) to normalize angle differences to [-π, π]
+
         @inline(__always)
         func shortestAngle(from a: CGFloat, to b: CGFloat) -> CGFloat {
             var d = b - a
@@ -1740,33 +1571,31 @@ final class RLServer {
             while d < -.pi { d += (.pi * 2) }
             return d
         }
-        
+
         var reward: Double = 0
         var done = false
-        
-        // do everything on main thread that touches nodes/scene
+
         await MainActor.run {
-            // we want the same per-tick authority as the player
             let dt: CGFloat = 1.0 / 60.0
-            
-            // record heading BEFORE stepping so we can clamp yaw after
+
+            // Heading before we let the car update
             let z0 = agent.zRotation
-            
-            // clamp inputs to player ranges (allow reverse)
+
+            // Clamp inputs
             let t = max(-1, min(1, throttle))
             let s = max(-1, min(1, steer))
             let f = fire
             precondition(t.isFinite && s.isFinite, "non-finite action")
-            
-            // feed controls through the same path the player uses
+
+            // Feed controls like the player
             agent.setControls(
                 throttle: t,
                 steer: s,
                 fire: f,
-                reverseIntent: t < -0.1        // informs CarNode’s reverse penalty logic
+                reverseIntent: t < -0.1
             )
-            
-            // keep your scene’s fire gating as-is
+
+            // Fire gating is scene-owned
             if f {
                 if (scene as? GameScene)?.aiShouldFire(shooter: agent, at: target) == true {
                     agent.startAutoFire(on: scene)
@@ -1774,34 +1603,50 @@ final class RLServer {
             } else {
                 agent.stopAutoFire()
             }
-            
-            // advance exactly one fixed tick for training
+
+            // Advance one fixed tick
             (scene as? GameSceneTraining)?.stepOnceForTraining?(dt: dt)
-            
-            // ── hard clamp: cap how much the car was allowed to rotate this “frame” ──
-            // this guarantees no snap-turns even if the scene integrates with a larger dt
+
+            // ---------- HARD CLAMP (prevents pivot-in-place) ----------
             let steerGain = agent.controlBoostActive ? (agent.turnRate * 1.25) : agent.turnRate
-            let maxYaw = steerGain * dt                          // radians allowed this tick
+
+            // current speed AFTER the tick
+            let v = agent.physicsBody?.velocity ?? .zero
+            let spd = hypot(v.dx, v.dy)
+
+            @inline(__always)
+            func smoothstep(_ x: CGFloat, _ e0: CGFloat, _ e1: CGFloat) -> CGFloat {
+                let t = max(0, min(1, (x - e0) / max(e1 - e0, 1)))
+                return t * t * (3 - 2 * t)
+            }
+
+            // 0→1 gate over 120..420 pts/s
+            let gate = smoothstep(spd, 120, 420)
+
+            // Allow less yaw when slow. If basically stopped, forbid any turn.
+            let maxYaw = steerGain * dt * gate
             let dz = shortestAngle(from: z0, to: agent.zRotation)
-            if abs(dz) > maxYaw {
+            if spd < 60 {
+                agent.zRotation = z0                        // hard block pivot
+            } else if abs(dz) > maxYaw {
                 let capped = z0 + max(-maxYaw, min(maxYaw, dz))
                 agent.zRotation = capped
-                // keep the mini HUD upright if you show it during training
-                (agent as CarNode).refreshMiniHUD()
             }
-            // ─────────────────────────────────────────────────────────────────────────
-            
-            // ---------- reward shaping (unchanged except sign fix on damage) ----------
+
+            // Keep the mini HUD correct if you're showing it during training
+            (agent as CarNode).refreshMiniHUD()
+            // ----------------------------------------------------------
+
+            // ---------- reward shaping ----------
             stepCount += 1
-            
+
             // positive number means we took damage this tick
             let tookDamage = -max(0, prevAgentHP - agent.hp)
             prevAgentHP = agent.hp
-            
+
             // speed term (~1.0 around 400 pts/s)
-            let v = agent.physicsBody?.velocity ?? .zero
-            let speedTerm = Double(hypot(v.dx, v.dy)) / 400.0
-            
+            let speedTerm = Double(spd) / 400.0
+
             // bonus when target loses a life
             var killBonus = 0.0
             let tl = target.livesLeft
@@ -1809,29 +1654,28 @@ final class RLServer {
                 killBonus = 5.0
                 prevTargetLives = tl
             }
-            
-            // penalties
+
             let deathPenalty  = agent.isDead ? -3.0 : 0.0
             let reversePenalty = -agent.consumeReversePenalty()
-            let isWinRound = target.isDead || target.livesLeft == 0 ? 30.0 : 0.0
-            
+            let isWinRound = (target.isDead || target.livesLeft == 0) ? 30.0 : 0.0
+
             reward = 0.001
-            + speedTerm
-            + 0.20 * Double(tookDamage)
-            + killBonus
-            + deathPenalty
-            + reversePenalty
-            + isWinRound
-            
+                   + speedTerm
+                   + 0.20 * Double(tookDamage)
+                   + killBonus
+                   + deathPenalty
+                   + reversePenalty
+                   + isWinRound
+
             done = agent.isDead || stepCount >= maxSteps
-            // -------------------------------------------------------------------------
+            // -----------------------------------
         }
-        
-        // observation AFTER the physics step
+
+        // Observation AFTER physics step
         let obs = await MainActor.run { (scene as? GameScene)?.rlObservation() ?? [] }
         return WireResp(obs: obs, reward: reward, done: done)
     }
-    
+
     private func handle(_ line: LineConn) {
         Task {
             // ALWAYS send init line immediately
@@ -1963,3 +1807,280 @@ extension CarNode {
         }
     }
 }
+
+// MARK: - Air / Verticality  ✅ fixed
+extension CarNode {
+    private struct LandAssoc { static var t = 0 }
+    private var _lastLandingT: TimeInterval {
+        get { (objc_getAssociatedObject(self, &LandAssoc.t) as? TimeInterval) ?? 0 }
+        set { objc_setAssociatedObject(self, &LandAssoc.t, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
+    }
+
+    private struct LifeAssoc { static var max = 0, left = 0 }
+    var maxLives: Int {
+        get { (objc_getAssociatedObject(self, &LifeAssoc.max) as? Int) ?? 3 }
+        set {
+            let v = max(1, newValue)
+            objc_setAssociatedObject(self, &LifeAssoc.max, v, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+            if livesLeft > v { livesLeft = v }
+            onLivesChanged?(livesLeft, v)
+        }
+    }
+    var livesLeft: Int {
+        get { (objc_getAssociatedObject(self, &LifeAssoc.left) as? Int) ?? 3 }
+        set {
+            let v = max(0, newValue)
+            objc_setAssociatedObject(self, &LifeAssoc.left, v, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+            onLivesChanged?(v, maxLives)
+        }
+    }
+
+    struct GhostAssoc { static var g = 0 }
+
+    var _airGhosting: Bool {
+        get { (objc_getAssociatedObject(self, &GhostAssoc.g) as? Bool) ?? false }
+        set { objc_setAssociatedObject(self, &GhostAssoc.g, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
+    }
+
+    private struct AirAssoc {
+        static var g: UInt8 = 0, z: UInt8 = 0, v: UInt8 = 0, a: UInt8 = 0
+        static var m: UInt8 = 0, s: UInt8 = 0
+        static var lock: UInt8 = 0
+    }
+
+    // vertical state
+    var gravity: CGFloat {
+        get { objc_getAssociatedObject(self, &AirAssoc.g) as? CGFloat ?? -1800 }
+        set { objc_setAssociatedObject(self, &AirAssoc.g, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
+    }
+    var zLift: CGFloat {
+        get { objc_getAssociatedObject(self, &AirAssoc.z) as? CGFloat ?? 0 }
+        set { objc_setAssociatedObject(self, &AirAssoc.z, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
+    }
+    var vz: CGFloat {
+        get { objc_getAssociatedObject(self, &AirAssoc.v) as? CGFloat ?? 0 }
+        set { objc_setAssociatedObject(self, &AirAssoc.v, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
+    }
+    var isAirborne: Bool {
+        get { objc_getAssociatedObject(self, &AirAssoc.a) as? Bool ?? false }
+        set { objc_setAssociatedObject(self, &AirAssoc.a, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
+    }
+
+    var _groundMask: UInt32 {
+        get { objc_getAssociatedObject(self, &AirAssoc.m) as? UInt32 ?? (physicsBody?.collisionBitMask ?? 0) }
+        set { objc_setAssociatedObject(self, &AirAssoc.m, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
+    }
+    var shadowNode: SKShapeNode? {
+        get { objc_getAssociatedObject(self, &AirAssoc.s) as? SKShapeNode }
+        set { objc_setAssociatedObject(self, &AirAssoc.s, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
+    }
+
+    // hard “no-collisions” grace while jumping (prevents rim catch)
+    private var _airborneLockUntil: TimeInterval {
+        get { (objc_getAssociatedObject(self, &AirAssoc.lock) as? TimeInterval) ?? 0 }
+        set { objc_setAssociatedObject(self, &AirAssoc.lock, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
+    }
+
+    /// Call once after creation
+    func enableAirPhysics() {
+        _groundMask = physicsBody?.collisionBitMask ?? 0
+
+        let sh = SKShapeNode(ellipseOf: CGSize(width: 44, height: 18))
+        sh.fillColor = .black
+        sh.strokeColor = .clear
+        sh.alpha = 0.35
+        sh.zPosition = -1
+        addChild(sh)
+        shadowNode = sh
+    }
+
+    /// Robust vertical sim + ALWAYS-drop-off-hill assist
+    func stepVertical(dt: CGFloat, groundHeight: CGFloat) {
+        guard let pb = physicsBody else { return }
+        let wasAir = isAirborne
+        let now = CACurrentMediaTime()
+
+        // 1) Integrate vertical kinematics
+        vz += gravity * dt
+        zLift += vz * dt
+
+        // Clearance above terrain at the car’s XY
+        let clearance = zLift - groundHeight
+
+        // 2) Airborne state with ramp lock
+        if now < _airborneLockUntil {
+            isAirborne = true
+        } else if isAirborne {
+            // Stay airborne until we actually touch while falling
+            if clearance <= 1.5 && vz <= 0 { isAirborne = false }
+        } else {
+            // 2a) ALWAYS-DROP-OFF-HILL ASSIST (works at ANY speed, even 0)
+            // Detect a sharp height falloff directly "downhill" from our current point.
+            if let scn = scene as? GameScene {
+                // Finite-difference gradient of ground height
+                let h: CGFloat = 8
+                @inline(__always) func GH(_ p: CGPoint) -> CGFloat { scn.groundHeight(at: p) }
+                let p0 = position
+                let h0 = groundHeight
+                let hx = GH(CGPoint(x: p0.x + h, y: p0.y)) - GH(CGPoint(x: p0.x - h, y: p0.y))
+                let hy = GH(CGPoint(x: p0.x, y: p0.y + h)) - GH(CGPoint(x: p0.x, y: p0.y - h))
+
+                // Uphill unit (∇h); downhill is the opposite
+                var gx = hx * 0.5, gy = hy * 0.5
+                let gLen = max(1e-6, hypot(gx, gy))
+                gx /= gLen; gy /= gLen
+                let down = CGVector(dx: -gx, dy: -gy)
+
+                // Sample heights a short distance outward (detects rim)
+                let d1: CGFloat = 22
+                let d2: CGFloat = 44
+                let h1 = GH(CGPoint(x: p0.x + down.dx * d1, y: p0.y + down.dy * d1))
+                let h2 = GH(CGPoint(x: p0.x + down.dx * d2, y: p0.y + down.dy * d2))
+
+                // How much the ground drops just beyond the edge
+                let drop1 = h0 - h1
+                let drop2 = h1 - h2
+
+                // Trigger if there is a real “edge” (two consecutive drops), AND we are not already in the air
+                // Thresholds tuned to your hill profile; safe & conservative.
+                let isEdge = (drop1 > 6 && drop2 > 6)
+
+                if isEdge {
+                    // Force a short airborne to pass the inner rim cleanly
+                    isAirborne = true
+                    _airborneLockUntil = max(_airborneLockUntil, now + 0.30)
+                    // Tiny lift so we don’t scrape the rim at zero speed
+                    vz = max(vz, 90)
+                    // Disable ALL collisions while airborne (rim is Category.wall)
+                    pb.collisionBitMask = 0
+
+                    // Ensure we actually move outward even from a stop
+                    let minOutSpeed: CGFloat = 160   // pt/s; small, just to clear rim
+                    let vdot = pb.velocity.dx * down.dx + pb.velocity.dy * down.dy
+                    if vdot < minOutSpeed {
+                        let add = minOutSpeed - vdot
+                        pb.velocity = CGVector(dx: pb.velocity.dx + down.dx * add,
+                                               dy: pb.velocity.dy + down.dy * add)
+                    }
+                }
+            }
+
+            // Fallback: if we separated from ground or moving upward, become airborne
+            if !isAirborne, (clearance > 3.0 || vz > 35) {
+                isAirborne = true
+            }
+        }
+
+        // 3) Clamp to terrain when grounded
+        if !isAirborne && zLift < groundHeight {
+            zLift = groundHeight
+            if vz < 0 { vz = 0 }
+        }
+
+        // 4) Toggle collisions by state
+        pb.collisionBitMask = isAirborne ? 0 : _groundMask
+
+        // 5) Shadow squash by height (visual)
+        if let sh = shadowNode {
+            let h = max(0, zLift - groundHeight)
+            let k = min(1, h / 140)      // 0 at ground → 1 by ~140 pts
+            sh.setScale(1 - 0.25 * k)
+            sh.alpha = 0.25 + 0.25 * (1 - k)
+        }
+
+        // 6) Landing energy handling
+        if wasAir && !isAirborne {
+            // Split velocity into car-forward / sideways
+            let heading = zRotation + .pi/2
+            let f = CGVector(dx: cos(heading), dy: sin(heading))
+            let s = CGVector(dx: -f.dy,        dy: f.dx)
+            let v  = pb.velocity
+            let vf = v.dx * f.dx + v.dy * f.dy
+            let vs = v.dx * s.dx + v.dy * s.dy
+
+            // Impact-scaled damping
+            let impact = min(1, abs(vz) / 1100)
+
+            // Bias keep-forward if landing while going downhill
+            var alignDown: CGFloat = 0
+            if let scn = scene as? GameScene {
+                let H = { (x: CGFloat, y: CGFloat) in scn.groundHeight(at: CGPoint(x: x, y: y)) }
+                let hh: CGFloat = 8
+                let hx = H(position.x + hh, position.y) - H(position.x - hh, position.y)
+                let hy = H(position.x, position.y + hh) - H(position.x, position.y - hh)
+                var down = CGVector(dx: -hx * 0.5, dy: -hy * 0.5)
+                let dl = max(1e-6, hypot(down.dx, down.dy))
+                down.dx /= dl; down.dy /= dl
+                alignDown = max(0, f.dx * down.dx + f.dy * down.dy)
+            }
+
+            let baseKeepF: CGFloat = 0.65 - 0.35 * impact
+            let boostF:    CGFloat = 0.35 * alignDown
+            let keepFwd = max(0.25, min(0.95, baseKeepF + boostF))
+            let keepSide = max(0.28, 0.50 - 0.30 * impact)
+
+            let newVf = vf * keepFwd
+            let newVs = vs * keepSide
+            pb.velocity = CGVector(dx: f.dx * newVf + s.dx * newVs,
+                                   dy: f.dy * newVf + s.dy * newVs)
+
+            // Tiny landing pop (rate-limited)
+            let now2 = CACurrentMediaTime()
+            if now2 - _lastLandingT > 0.08 {
+                removeAction(forKey: "landPop")
+                run(.sequence([.scale(to: 1.03, duration: 0.05),
+                               .scale(to: 1.00, duration: 0.08)]),
+                    withKey: "landPop")
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                _lastLandingT = now2
+            }
+        }
+    }
+
+    /// `heading` is the ramp forward direction.
+    /// Guarantees rim-clear at ≥ 80 km/h (with our world scale: 20 px/m → 0.18 km/h per pt/s).
+    func applyRampImpulse(vzAdd: CGFloat, forwardBoost: CGFloat, heading: CGFloat) {
+        guard let pb = physicsBody else { return }
+
+        // mark airborne + small initial lift so we don't immediately "land" on flat
+        isAirborne = true
+        zLift = max(zLift, 2.0)
+        _airGhosting = true
+        pb.collisionBitMask = 0
+        speedCapBonus = 0
+
+        // forward basis from ramp
+        let f = CGVector(dx: cos(heading), dy: sin(heading))
+        let s = CGVector(dx: -f.dy,         dy: f.dx)
+        let v = pb.velocity
+        let vf = v.dx * f.dx + v.dy * f.dy
+        let vs = v.dx * s.dx + v.dy * s.dy
+
+        // Apply ramp losses similar to before (slight)
+        let steep = min(1.0, max(0.0, vzAdd / 1100.0))
+        let loss  = min(0.60, 0.12 + 0.32 * steep)
+        let newVf = max(0, vf * (1 - loss)) + forwardBoost
+        let newVs = vs * (1 - loss * 0.25)
+        pb.velocity = CGVector(dx: f.dx * newVf + s.dx * newVs,
+                               dy: f.dy * newVf + s.dy * newVs)
+
+        // give actual upward velocity
+        vz += vzAdd
+
+        // ---- 80 km/h guarantee (world scale: 20 px/m ⇒ 0.18 km/h per pt/s) ----
+        let kmhPerPtPerSec: CGFloat = 0.18          // 3.6 / 20.0
+        let speedKmh = hypot(pb.velocity.dx, pb.velocity.dy) * kmhPerPtPerSec
+        if speedKmh >= 80 {
+            // ensure enough upward velocity and a collision-free grace to clear the rim
+            let minVz: CGFloat = 680                 // tuned for typical rim heights
+            if vz < minVz { vz = minVz }
+            let baseGrace: TimeInterval = 0.42       // time to travel over the rim
+            _airborneLockUntil = max(_airborneLockUntil, CACurrentMediaTime() + baseGrace)
+        } else {
+            // smaller grace derived from impulse magnitude
+            let t = 0.22 + 0.0006 * Double(max(0, vzAdd)) + 0.0002 * Double(max(0, forwardBoost))
+            _airborneLockUntil = max(_airborneLockUntil, CACurrentMediaTime() + t)
+        }
+    }
+}
+
