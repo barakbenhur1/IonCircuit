@@ -10,6 +10,10 @@ import UIKit
 import ObjectiveC
 import Network
 
+#if canImport(CoreML)
+import CoreML
+#endif
+
 // MARK: - Scene callbacks
 protocol CarNodeDelegate: AnyObject {
     func carNodeDidExplode(_ car: CarNode, at position: CGPoint)
@@ -45,7 +49,6 @@ private struct HUDAssoc {
 }
 
 final class CarNode: SKNode {
-    
     private enum Assoc {
         static var g: UInt8 = 0, z: UInt8 = 0, v: UInt8 = 0, a: UInt8 = 0
         static var m: UInt8 = 0, s: UInt8 = 0
@@ -57,6 +60,13 @@ final class CarNode: SKNode {
         static var airMask: UInt8 = 0
     }
     
+    var lockAngleUntilExitDeadzone = false
+    var angleLP: CGFloat = 0
+    var hasAngleLP = false
+    var isCoasting = false
+    
+    var aiControl: Bool = false
+    
     var _airMask: UInt32 {
         get { objc_getAssociatedObject(self, &Assoc.airMask) as? UInt32 ?? 0 }
         set { objc_setAssociatedObject(self, &Assoc.airMask, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
@@ -66,7 +76,7 @@ final class CarNode: SKNode {
     var hudYOffset: CGFloat = 32 {
         didSet { if miniHUD.parent != nil { miniHUD.position.y = hudYOffset } }
     }
-
+    
     // If true → keep HUD upright to screen. If false → HUD rotates with car.
     var hudKeepsScreenUpright: Bool = false
     
@@ -90,8 +100,7 @@ final class CarNode: SKNode {
     private var tailL: SKShapeNode!
     private var tailR: SKShapeNode!
     
-    
-    public var wallBumpPenalty: Double = 0.05
+    public var wallBumpPenalty: Double = -0.05
     private var _bumpedWallThisStep = false
     
     // Exhaust VFX
@@ -160,15 +169,31 @@ final class CarNode: SKNode {
     private let maxYawAccelAI:  CGFloat = 12.0     // rad/s^2 clamp
     private var  yawSpeedAI:    CGFloat = 0        // internal yaw rate (AI only)
     
+    // Auto-hide for the enemy mini HP UI
+    private let miniAutoHideDelay: TimeInterval = 2.5
+    private let miniFadeDuration: TimeInterval = 0.25
+    
+    // MARK: - Mini Enhancement chips (shown above HP bar)
+    private let miniEnhBar = SKNode()
+    private var enhChips: [EnhancementKind: SKNode] = [:]
+    
     private struct MiniUI {
         static let hpW: CGFloat = 60
         static let hpH: CGFloat = 8
         static let hpCorner: CGFloat = 4
-        static let overlayInset: CGFloat = 1      // shield overlay inset
+        static let overlayInset: CGFloat = 1
+
+        // NEW — enhancement strip sizing/placement
+        static let enhScale: CGFloat = 1.9     // <- bigger badges
+        static let enhGap: CGFloat   = -1.0    // <- slight overlap (no visible space)
+        static let enhYOffset: CGFloat = hpH + 8 + 24  // move up to clear hearts
     }
     
     private func installMiniUIIfNeeded() {
         guard miniHUD.parent == nil else { return }
+        miniHUD.alpha = 0.0
+        miniHUD.isHidden = true
+        
         miniHUD.zPosition = 150
         miniHUD.position = CGPoint(x: 0, y: hudYOffset)
         addChild(miniHUD)
@@ -197,8 +222,120 @@ final class CarNode: SKNode {
         
         // Lives row above the bar
         miniHUD.addChild(miniLivesNode)
-        miniLivesNode.position = CGPoint(x: 0, y: MiniUI.hpH + 8)  // was +8 → closer to bar
+        miniLivesNode.position = CGPoint(x: 0, y: MiniUI.hpH + 14)  // was +8 → closer to bar
+        buildMiniEnhBar()
         refreshMiniHUD()
+    }
+    
+    private func buildMiniEnhBar() {
+        // attach to miniHUD so it auto-hides/fades together
+        miniHUD.addChild(miniEnhBar)
+        miniEnhBar.position = CGPoint(x: 0, y: MiniUI.enhYOffset)
+
+        let order: [EnhancementKind] = [.weaponRapid, .weaponDamage, .weaponSpread, .control, .shrink]
+        enhChips.removeAll()
+
+        // build chips once
+        for kind in order {
+            let chip = smallEnhChip(for: kind)
+            chip.setScale(MiniUI.enhScale)
+            chip.alpha = 0.5
+            miniEnhBar.addChild(chip)
+            enhChips[kind] = chip
+        }
+        layoutEnhChips(order: order)
+        refreshMiniEnhancements()
+    }
+    
+    func stepOnceForTraining(dt: CGFloat) {
+        // run one sim tick without rendering extras
+        update(dt)
+    }
+
+    private func layoutEnhChips(order: [EnhancementKind]) {
+        // apply consistent scale and compute widths
+        let chips = order.compactMap { enhChips[$0] }
+        let widths: [CGFloat] = chips.map { chip in
+            chip.setScale(MiniUI.enhScale)
+            return chip.calculateAccumulatedFrame().width
+        }
+        let total = widths.reduce(0, +) + MiniUI.enhGap * CGFloat(max(0, chips.count - 1))
+        var cursor = -total / 2
+
+        for (chip, w) in zip(chips, widths) {
+            chip.position = CGPoint(x: cursor + w/2, y: 0)
+            cursor += w + MiniUI.enhGap
+        }
+    }
+    
+    private func smallEnhChip(for kind: EnhancementKind) -> SKNode {
+        let r: CGFloat = 9                           // bigger base circle
+        let base = SKShapeNode(circleOfRadius: r)
+        base.fillColor = UIColor(white: 0, alpha: 0.35)
+        base.strokeColor = UIColor(white: 1, alpha: 0.18)
+        base.lineWidth = 1.2
+
+        let glyph = SKShapeNode()
+        glyph.strokeColor = .white
+        glyph.lineWidth = 1.6                         // thicker so it reads at size
+        glyph.alpha = 0.95
+
+        let p = CGMutablePath()
+        switch kind {
+        case .weaponRapid:
+            p.move(to: CGPoint(x: -3.5, y: -3)); p.addLine(to: CGPoint(x: -3.5, y: 3))
+            p.move(to: CGPoint(x:  0.0, y: -3)); p.addLine(to: CGPoint(x:  0.0, y: 3))
+            p.move(to: CGPoint(x:  3.5, y: -3)); p.addLine(to: CGPoint(x:  3.5, y: 3))
+        case .weaponDamage:
+            p.move(to: CGPoint(x: -4.2, y: -1)); p.addLine(to: CGPoint(x: 0, y: 4.2)); p.addLine(to: CGPoint(x: 4.2, y: -1))
+        case .weaponSpread:
+            p.move(to: CGPoint(x: -4.6, y: -3)); p.addLine(to: CGPoint(x: -1.2, y: 3))
+            p.move(to: CGPoint(x:  4.6, y: -3)); p.addLine(to: CGPoint(x:  1.2, y: 3))
+        case .control:
+            p.addEllipse(in: CGRect(x: -2.3, y: -2.3, width: 4.6, height: 4.6))
+        case .shrink:
+            p.addRect(CGRect(x: -2.4, y: -2.4, width: 4.8, height: 4.8))
+        default:
+            p.addEllipse(in: CGRect(x: -1.6, y: -1.6, width: 3.2, height: 3.2))
+        }
+        glyph.path = p
+        base.addChild(glyph)
+              
+        return base
+    }
+    
+    private func setChip(_ kind: EnhancementKind, active: Bool) {
+        guard let chip = enhChips[kind] else { return }
+        let a: CGFloat = active ? 1.0 : 0.5
+        let s: CGFloat = active ? MiniUI.enhScale : 0.85
+        chip.removeAllActions()
+        chip.run(.group([.fadeAlpha(to: a, duration: 0.15),
+                         .scale(to: s, duration: 0.15)]))
+    }
+    
+    func refreshMiniEnhancements() {
+        // shield is already shown by your shield overlay; only show persistent badges here
+        setChip(.weaponRapid,  active: weaponMod == .rapid)
+        setChip(.weaponDamage, active: weaponMod == .damage)
+        setChip(.weaponSpread, active: weaponMod == .spread)
+        setChip(.control,      active: controlBoostActive)
+        setChip(.shrink,       active: miniModeActive)
+        // auto-reveal the strip briefly
+    }
+    
+    @objc func resetEnhancements() { controlBoostActive = false; miniModeActive = false; weaponMod = .none; shield = 0 }
+    
+    private func revealHPUIThenAutoHide() {
+        guard miniHUD.parent != nil else { return }
+        let nodes: [SKNode] = [miniHUD, miniEnhBar]   // <- include the strip
+        for n in nodes {
+            n.removeAction(forKey: "cn.hp.autohide")
+            n.isHidden = false
+            n.alpha = 1.0
+            let seq = SKAction.sequence([.wait(forDuration: miniAutoHideDelay),
+                                         .fadeOut(withDuration: miniFadeDuration)])
+            n.run(seq, withKey: "cn.hp.autohide")
+        }
     }
     
     private func layoutMiniHearts() {
@@ -225,8 +362,6 @@ final class CarNode: SKNode {
             node.position = CGPoint(x: -width/2 + CGFloat(i) * spacing, y: 0)
         }
     }
-    
-    @objc func resetEnhancements() { controlBoostActive = false; miniModeActive = false; weaponMod = .none; shield = 0 }
     
     private func makeHeartPath(size r: CGFloat) -> CGPath {
         // classic heart
@@ -418,10 +553,6 @@ final class CarNode: SKNode {
         self.physicsBody = pb
         
         zRotation = 0
-        
-        // Mount the mini HUD chip
-        installMiniUIIfNeeded()
-        refreshMiniHUD()
     }
     
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -504,6 +635,7 @@ extension CarNode {
             hp = max(0, hp - remaining)
             onHPChanged?(hp, maxHP)
             refreshMiniHP()
+            revealHPUIThenAutoHide()   // <— show now, auto-hide later
         }
         
         // Hit feedback
@@ -526,32 +658,45 @@ extension CarNode {
             let before = hp
             hp = min(maxHP, hp + 20)
             if hp != before { onHPChanged?(hp, maxHP); refreshMiniHP() }
+            pick = true
+            rlNotePickup()
             return hp > before
             
         case .shield20:
             let before = shield
             shield = min(100, shield + 20)   // refreshMiniShield is called by setter
+            pick = true
+            rlNotePickup()
             return shield > before
             
-        case .weaponRapid:  weaponMod = .rapid;  pick = true
-        case .weaponDamage: weaponMod = .damage; pick = true
-        case .weaponSpread: weaponMod = .spread; pick = true
+        case .weaponRapid:  weaponMod = .rapid;  pick = true; rlNotePickup()
+        case .weaponDamage: weaponMod = .damage; pick = true; rlNotePickup()
+        case .weaponSpread: weaponMod = .spread; pick = true; rlNotePickup()
             
         case .control:
-            if controlBoostActive { pick = false }
+            // only if not already active
+            guard !controlBoostActive else { return false }
             controlBoostActive = true
             pick = true
+            rlNotePickup()
+            return true
             
         case .shrink:
-            if miniModeActive { pick = false }
+            // only if not already active
+            guard !miniModeActive else { return false }
             miniModeActive = true
             pick = true
+            rlNotePickup()
+            return true
             
         @unknown default:
             pick = false
         }
         
-        if pick { rlNotePickup() }
+        if pick {
+            refreshMiniEnhancements()
+            revealHPUIThenAutoHide()
+        }
         return pick
     }
 }
@@ -662,7 +807,7 @@ extension CarNode {
         let heading = zRotation + .pi/2
         
         func spawn(angle: CGFloat) {
-            let muzzleWorld = convert(CGPoint(x: 0, y: muzzleOffset), to: scene)
+            let muzzleWorld = convert(CGPoint(x: 0, y: muzzleOffset + 24), to: scene)
             let dir = CGVector(dx: cos(angle), dy: sin(angle))
             let b = BulletNode(style: style, damage: currentBulletDamage)
             b.name = "bullet"
@@ -676,7 +821,10 @@ extension CarNode {
             b.userData = (b.userData ?? NSMutableDictionary())
             b.userData?["owner"] = self
             
+            b.userData?["safeUntil"] = now + 0.18
             scene.addChild(b)
+            
+            Audio.shared.playShoot(at: b.position)
             
             let vCar = pb.velocity
             b.physicsBody?.velocity = CGVector(
@@ -697,57 +845,6 @@ extension CarNode {
         muzzleFlash()
     }
     
-    func drainRLReward(versus target: CarNode, dt: CGFloat) -> (Double, Bool) {
-        // --- distance shaping (progress toward target) ---
-        let oldDist = rl_prevDist
-        let d = hypot(target.position.x - position.x,
-                      target.position.y - position.y)
-        rl_prevDist = d
-        let toward: CGFloat = (oldDist - d) * 0.002
-        
-        // --- liveness / motion ---
-        let spd: CGFloat = physicsBody.map { hypot($0.velocity.dx, $0.velocity.dy) } ?? 0
-        let alive: CGFloat = 0.0015 * dt
-        let vel:   CGFloat = 0.0006 * spd * dt
-        
-        // --- one-tick events (set elsewhere this frame) ---
-        let pickup: CGFloat = rl_didPickup ? 1.0 : 0.0
-        let dmgOut: CGFloat = 0.5 * CGFloat(rl_dealt)      // reward for damage dealt
-        let dmgIn:  CGFloat = -0.7 * CGFloat(rl_took)      // punish for damage taken (bullets, rams)
-        let wall:   CGFloat = rl_collided ? -0.1 : 0.0     // small nudge against wall bumps
-        
-        // small reward for breaking map obstacles
-        let broke:  CGFloat = 0.3 * CGFloat(rl_destroyedObstacles)
-        
-        // big reward on kill (credited to the killer via notifyKilledOpponent)
-        let kill:   CGFloat = 8.0 * CGFloat(rl_kills)
-        
-        // BIG punish on death (one time, when explode() set rl_died = true)
-        let death:  CGFloat = rl_died ? -12.0 : 0.0
-        
-        // flee incentive when low HP (encourage survival)
-        let flee: CGFloat = (hp < maxHP / 3) ? max(0, d - oldDist) * 0.002 : 0
-        
-        let reversePenalty = -consumeReversePenalty()
-        
-        // sum
-        let total: CGFloat = toward + flee + alive + vel + pickup + dmgOut + dmgIn + wall + broke + kill + death + reversePenalty
-        
-        // clear one-tick flags
-        rl_didPickup = false
-        rl_dealt = 0
-        rl_took = 0
-        rl_collided = false
-        rl_died = false
-        rl_kills = 0
-        rl_destroyedObstacles = 0
-        
-        // episode bookkeeping
-        rl_step += 1
-        let done = isDead || rl_step >= rl_maxSteps
-        return (Double(total), done)
-    }
-    
     @objc func notifyKilledOpponent() { rl_kills += 1 }
     
     // MARK: - Learned policy (Core ML) integration
@@ -758,27 +855,87 @@ extension CarNode {
         set { objc_setAssociatedObject(self, &PolicyAssoc.policy, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
     }
     
-    /// Load a compiled policy from the app bundle by name (without extension).
-    /// Example: try enemy.useLearnedPolicyFromBundle(named: "IonCircuitPolicy")
     @discardableResult
-    func useLearnedPolicyFromBundle(named: String,
-                                    obsKey: String = "obs",
-                                    actKeys: [String] = ["actions","mu","action"]) throws -> RLPolicy
-    {
-        guard let url = Bundle.main.url(forResource: named, withExtension: "mlmodelc") ??
-                Bundle.main.url(forResource: named, withExtension: "mlmodel")
-        else { throw NSError(domain: "RLPolicy", code: 1, userInfo: [NSLocalizedDescriptionKey: "Model \(named) not found in bundle"]) }
+    func useLearnedPolicyInstalled(
+        named: String,
+        defaultName: String? = "DefaultPolicy",
+        obsKey: String = "obs",
+        actKeys: [String] = ["actions","mu","action"]
+    ) throws -> RLPolicy {
         
-        let p = try RLPolicy(modelURL: url, obsKey: obsKey, actKeys: actKeys)
+        func installedPoliciesDirectory() throws -> URL {
+            let fm = FileManager.default
+            let base = try fm.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                                  appropriateFor: nil, create: true)
+            let dir = base.appendingPathComponent("Policies", isDirectory: true)
+            if !fm.fileExists(atPath: dir.path) {
+                try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            }
+            return dir
+        }
+        
+        func urlForPolicy(_ name: String) throws -> URL? {
+            let fm  = FileManager.default
+            let dir = try installedPoliciesDirectory()
+            let compiled = dir.appendingPathComponent("\(name).mlmodelc", isDirectory: true)
+            let raw      = dir.appendingPathComponent("\(name).mlmodel",  isDirectory: false)
+            
+            if fm.fileExists(atPath: compiled.path) { return compiled }
+            if fm.fileExists(atPath: raw.path) {
+#if canImport(CoreML)
+                return try MLModel.compileModel(at: raw)
+#else
+                throw NSError(domain: "RLPolicy", code: 9,
+                              userInfo: [NSLocalizedDescriptionKey:
+                                            "CoreML not available to compile \(raw.lastPathComponent)"])
+#endif
+            }
+            if let b = Bundle.main.url(forResource: name, withExtension: "mlmodelc")
+                ?? Bundle.main.url(forResource: name, withExtension: "mlmodel") {
+#if canImport(CoreML)
+                if b.pathExtension == "mlmodel" { return try MLModel.compileModel(at: b) }
+#endif
+                return b
+            }
+            return nil
+        }
+        
+        // Try primary, then fallback
+        let url = try urlForPolicy(named)
+        ?? (defaultName != nil ? try urlForPolicy(defaultName!) : nil)
+        
+        guard let modelURL = url else {
+            let msg = defaultName != nil
+            ? "Model \(named) not found; fallback \(defaultName!) also missing."
+            : "Model \(named) not found."
+            throw NSError(domain: "RLPolicy", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: msg])
+        }
+        
+        let p = try RLPolicy(modelURL: modelURL, obsKey: obsKey, actKeys: actKeys)
         self.rlPolicy = p
+        print("✅ Loaded policy:", modelURL.path)
         return p
+    }
+    
+    /// Convenience check (for enabling/disabling the toggle)
+    static func hasPolicyAvailable(named: String, defaultName: String? = nil) -> Bool {
+        do {
+            // reuse the same finder quickly
+            let dummy = CarNode()
+            _ = try dummy.useLearnedPolicyInstalled(named: named, defaultName: defaultName)
+            dummy.rlPolicy = nil
+            return true
+        } catch {
+            return false
+        }
     }
     
     /// If a policy is attached, compute action and set controls. Uses `aiTarget` as the opponent to chase.
     private func stepLearnedPolicyIfAny() {
         guard let policy = rlPolicy,
               let scn = scene,
-              let tgt = aiTarget else { return }
+              let tgt = target else { return }
         
         let obs = rlObservation(target: tgt, scene: scn) // 16 doubles
         if let a = try? policy.act(obs: obs) {
@@ -787,7 +944,6 @@ extension CarNode {
             if a.fire { startAutoFire(on: scn) } else { stopAutoFire() }
         }
     }
-    
     
     /// Use this when you KNOW who caused the damage (bullet owner, rammer, etc.)
     func takeDamage(from attacker: CarNode?, amount: Int, at worldPoint: CGPoint?) {
@@ -913,6 +1069,13 @@ extension CarNode {
         hp = maxHP
         isDead = false
         onHPChanged?(hp, maxHP)
+        revealHPUIThenAutoHide()
+        
+        // Fade it out quickly on a hard reset so the HUD is clean on respawn
+        [miniHUD, miniEnhBar].forEach {
+            $0.removeAction(forKey: "cn.hp.autohide")
+            $0.run(.fadeOut(withDuration: miniFadeDuration))
+        }
     }
     
     func enableCrashContacts() {
@@ -922,6 +1085,8 @@ extension CarNode {
     
     func handleCrash(contact: SKPhysicsContact, other: SKPhysicsBody, damage: Int) {
         guard let pb = physicsBody, !isDead else { return }
+        
+        Audio.shared.playCrash(at: contact.contactPoint, baseVolume: min(0.3, Float(damage)/120))
         
         // --- Always do a small bounce (walls, hills, obstacles, cars) ---
         let hitPoint = contact.contactPoint
@@ -971,8 +1136,16 @@ extension CarNode {
         let now = CACurrentMediaTime()
         let iFrame: TimeInterval = 0.12
         if now - lastHitTime < iFrame { return }
+        if kind == .player {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        }
         lastHitTime = now
         applyDamage(damage, hitWorldPoint: hitPoint)
+        
+        if other.node is WormSegmentNode {
+            rlNoteTookDamage(damage)
+        }
+        
         rlNoteCollision()
     }
     
@@ -1008,6 +1181,8 @@ extension CarNode {
         guard !isDead else { return }
         isDead = true
         rl_died = true
+        
+        Audio.shared.playExplode(at: worldPoint)
         
         // Freeze collisions
         if let pb = physicsBody {
@@ -1113,7 +1288,7 @@ extension CarNode {
         set { objc_setAssociatedObject(self, &RoleAssoc.k, newValue.rawValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
     }
     
-    weak var aiTarget: CarNode? {
+    weak var target: CarNode? {
         get { objc_getAssociatedObject(self, &RoleAssoc.tgt) as? CarNode }
         set { objc_setAssociatedObject(self, &RoleAssoc.tgt, newValue, .OBJC_ASSOCIATION_ASSIGN) }
     }
@@ -1125,10 +1300,10 @@ extension CarNode {
     
     func configure(kind: Kind, target: CarNode? = nil) {
         self.kind = kind
-        self.aiTarget = target
-        if kind == .enemy { enableCrashContacts() }
-        // scale chip a bit smaller on enemies
-        miniHUD.setScale(kind == .player ? 0.85 : 0.65)
+        self.target = target
+        installMiniUIIfNeeded()
+        refreshMiniHUD()
+        enableCrashContacts()
     }
     
     @inline(__always) private func clamp(_ v: CGFloat, _ a: CGFloat, _ b: CGFloat) -> CGFloat {
@@ -1289,7 +1464,7 @@ extension CarNode {
         let tractionK = (controlBoostActive ? traction * 1.25 : traction)
 
         // --- rotation ---
-        if kind == .enemy {
+        if kind == .enemy || aiControl {
             // No in-place pivot: gate by total speed and clamp yaw accel/speed.
             @inline(__always)
             func smoothstep(_ x: CGFloat, _ e0: CGFloat, _ e1: CGFloat) -> CGFloat {
@@ -1364,13 +1539,34 @@ extension CarNode {
         // --- RL reverse penalty bookkeeping ---
         updateReversePenalty(dt: dt)
     }
-
+    
     public func consumeWallPenalty() -> Double {
         if _bumpedWallThisStep {
             _bumpedWallThisStep = false
             return wallBumpPenalty
         }
         return 0
+    }
+    
+    public func consumeWinBonus() -> Double {
+        guard target?.isDead == true || target?.livesLeft == 0 else { return 0.0 }
+        let winConstant = 30.0
+        
+        let hpBouns = {
+            switch hp {
+            case maxHP: 15.0
+            case 80...: 10.0
+            case 40...: 5.0
+            default: 0.0
+            }
+        }()
+        
+        return winConstant + hpBouns
+    }
+    
+    public func consumeLosePenalty() -> Double {
+        guard isDead || livesLeft == 0 else { return 0.0 }
+        return -30.0
     }
     
     public func consumeReversePenalty() -> Double {
@@ -1408,7 +1604,7 @@ extension CarNode {
         if _attemptedReverseThisStep { p += attemptedReversePenalty }         // intent-based
         if _backwardMotionThisStep  { p += 0.5 * attemptedReversePenalty }    // motion-based (softer)
         
-        _reversePenaltyThisStep = p
+        _reversePenaltyThisStep = -p
         
         // Reset intent flag so next frame must set it again explicitly.
         reverseIntent = false
@@ -1468,243 +1664,6 @@ final class RLRewardTracker {
         return (total, done)
     }
 }
-
-// Put this helper near RLServer:
-private extension CarNode {
-    func hardResetForTraining() {
-        physicsBody?.velocity = .zero
-        zRotation = 0
-        resetHP()
-        // If your scene owns pickups, clear them via protocol if you want:
-        (scene as? CarEnhancementResetting)?.resetEnhancements()
-    }
-}
-
-// Wire types (what Python expects) ----------------------------
-private struct WireStep: Codable { let a: [Double] }   // action vector
-private struct WireResp: Codable { let obs: [Double], reward: Double, done: Bool }
-
-// TCP line codec (newline-delimited JSON) --------------------
-private final class LineConn {
-    private let conn: NWConnection
-    private let q = DispatchQueue(label: "rl.line")
-    init(_ c: NWConnection) { conn = c }
-    func start() { conn.start(queue: q) }
-    func sendJSON<T: Encodable>(_ x: T) {
-        do {
-            let data = try JSONEncoder().encode(x)
-            conn.send(content: data + Data([0x0a]), completion: .contentProcessed { _ in })
-        } catch { print("RL send error:", error) }
-    }
-    func recvLines(_ onLine: @escaping (Data) -> Void) {
-        conn.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] data, _, _, _ in
-            guard let self, let data else { return }
-            for chunk in data.split(separator: 0x0a, omittingEmptySubsequences: true) {
-                onLine(Data(chunk))
-            }
-            self.recvLines(onLine)
-        }
-    }
-}
-
-// The server -------------------------------------------------
-final class RLServer {
-    private let listener: NWListener
-    private weak var scene: SKScene?
-    private weak var agent: CarNode?
-    private weak var target: CarNode?
-    
-    // simple bookkeeping for reward shaping
-    private var prevAgentHP = 0
-    private var prevTargetLives = 0
-    private var stepCount = 0
-    private let maxSteps = 1200
-    
-    init(scene: SKScene, agent: CarNode, target: CarNode, port: UInt16 = 5555) throws {
-        self.scene = scene
-        self.agent = agent
-        self.target = target
-        
-        let nwPort = NWEndpoint.Port(rawValue: port)!
-        listener = try NWListener(using: .tcp, on: nwPort)
-        listener.newConnectionHandler = { [weak self] c in
-            guard let self else { return }
-            let line = LineConn(c)
-            line.start()
-            self.handle(line)
-        }
-    }
-    
-    func start() { listener.start(queue: .global()) }
-    func stop()  { listener.cancel() }
-    
-    // MARK: - Episode reset and initial obs
-    private func resetEpisode() async -> WireResp {
-        guard let scene, let agent, let target else { return WireResp(obs: [], reward: 0, done: true) }
-        await MainActor.run {
-            _ = (scene as? GameSceneTraining)?.resetForTraining?()
-            
-            // single place that restores "player-like" baseline
-            agent.hardResetForTraining()  // zero velocity, zRotation=0, full HP, clears scene enhancements via protocol
-            
-            // belt & suspenders in case scene's reset doesn't touch these:
-            agent.controlBoostActive = false
-            agent.miniModeActive     = false
-            agent.speedCapBonus      = 0
-            agent.shield             = 0
-        }
-        stepCount = 0
-        prevAgentHP = await MainActor.run { agent.hp }
-        prevTargetLives = await MainActor.run { target.livesLeft }
-        let obs = await MainActor.run { (scene as? GameScene)?.rlObservation() ?? [] }
-        return WireResp(obs: obs, reward: 0, done: false)
-    }
-    
-    // MARK: - One control/step/reward cycle
-    private func stepOnce(throttle: CGFloat, steer: CGFloat, fire: Bool) async -> WireResp {
-        guard let scene, let agent, let target else { return WireResp(obs: [], reward: 0, done: true) }
-
-        @inline(__always)
-        func shortestAngle(from a: CGFloat, to b: CGFloat) -> CGFloat {
-            var d = b - a
-            while d > .pi  { d -= (.pi * 2) }
-            while d < -.pi { d += (.pi * 2) }
-            return d
-        }
-
-        var reward: Double = 0
-        var done = false
-
-        await MainActor.run {
-            let dt: CGFloat = 1.0 / 60.0
-
-            // Heading before we let the car update
-            let z0 = agent.zRotation
-
-            // Clamp inputs
-            let t = max(-1, min(1, throttle))
-            let s = max(-1, min(1, steer))
-            let f = fire
-            precondition(t.isFinite && s.isFinite, "non-finite action")
-
-            // Feed controls like the player
-            agent.setControls(
-                throttle: t,
-                steer: s,
-                fire: f,
-                reverseIntent: t < -0.1
-            )
-
-            // Fire gating is scene-owned
-            if f {
-                if (scene as? GameScene)?.aiShouldFire(shooter: agent, at: target) == true {
-                    agent.startAutoFire(on: scene)
-                }
-            } else {
-                agent.stopAutoFire()
-            }
-
-            // Advance one fixed tick
-            (scene as? GameSceneTraining)?.stepOnceForTraining?(dt: dt)
-
-            // ---------- HARD CLAMP (prevents pivot-in-place) ----------
-            let steerGain = agent.controlBoostActive ? (agent.turnRate * 1.25) : agent.turnRate
-
-            // current speed AFTER the tick
-            let v = agent.physicsBody?.velocity ?? .zero
-            let spd = hypot(v.dx, v.dy)
-
-            @inline(__always)
-            func smoothstep(_ x: CGFloat, _ e0: CGFloat, _ e1: CGFloat) -> CGFloat {
-                let t = max(0, min(1, (x - e0) / max(e1 - e0, 1)))
-                return t * t * (3 - 2 * t)
-            }
-
-            // 0→1 gate over 120..420 pts/s
-            let gate = smoothstep(spd, 120, 420)
-
-            // Allow less yaw when slow. If basically stopped, forbid any turn.
-            let maxYaw = steerGain * dt * gate
-            let dz = shortestAngle(from: z0, to: agent.zRotation)
-            if spd < 60 {
-                agent.zRotation = z0                        // hard block pivot
-            } else if abs(dz) > maxYaw {
-                let capped = z0 + max(-maxYaw, min(maxYaw, dz))
-                agent.zRotation = capped
-            }
-
-            // Keep the mini HUD correct if you're showing it during training
-            (agent as CarNode).refreshMiniHUD()
-            // ----------------------------------------------------------
-
-            // ---------- reward shaping ----------
-            stepCount += 1
-
-            // positive number means we took damage this tick
-            let tookDamage = -max(0, prevAgentHP - agent.hp)
-            prevAgentHP = agent.hp
-
-            // speed term (~1.0 around 400 pts/s)
-            let speedTerm = Double(spd) / 400.0
-
-            // bonus when target loses a life
-            var killBonus = 0.0
-            let tl = target.livesLeft
-            if tl < prevTargetLives {
-                killBonus = 5.0
-                prevTargetLives = tl
-            }
-
-            let deathPenalty  = agent.isDead ? -3.0 : 0.0
-            let reversePenalty = -agent.consumeReversePenalty()
-            let isWinRound = (target.isDead || target.livesLeft == 0) ? 30.0 : 0.0
-
-            reward = 0.001
-                   + speedTerm
-                   + 0.20 * Double(tookDamage)
-                   + killBonus
-                   + deathPenalty
-                   + reversePenalty
-                   + isWinRound
-
-            done = agent.isDead || stepCount >= maxSteps
-            // -----------------------------------
-        }
-
-        // Observation AFTER physics step
-        let obs = await MainActor.run { (scene as? GameScene)?.rlObservation() ?? [] }
-        return WireResp(obs: obs, reward: reward, done: done)
-    }
-
-    private func handle(_ line: LineConn) {
-        Task {
-            // ALWAYS send init line immediately
-            let initResp = await resetEpisode()
-            line.sendJSON(initResp)
-            
-            line.recvLines { [weak self] data in
-                guard let self else { return }
-                // parse action
-                guard let step = try? JSONDecoder().decode(WireStep.self, from: data) else { return }
-                let a = step.a
-                // a = [throttle>=0, steer ∈ [-1,1], fire>0.5?]
-                let throttle = CGFloat(a.indices.contains(0) ? a[0] : 0)
-                let steer    = CGFloat(a.indices.contains(1) ? a[1] : 0)
-                let fire     = (a.indices.contains(2) ? a[2] > 0.5 : false)
-                
-                Task {
-                    let resp = await self.stepOnce(throttle: throttle, steer: steer, fire: fire)
-                    line.sendJSON(resp)
-                    if resp.done {
-                        let initAgain = await self.resetEpisode()
-                        line.sendJSON(initAgain) // prime next episode
-                    }
-                }
-            }
-        }
-    }
-}
-
 // MARK: - Ion exhaust (texture + emitter)
 extension CarNode {
     static func makeIonTexture() -> SKTexture {
@@ -1722,7 +1681,7 @@ extension CarNode {
             ] as CFArray
             let locs: [CGFloat] = [0.0, 0.25, 0.70, 1.0]
             let grad = CGGradient(colorsSpace: space, colors: colors, locations: locs)!
-
+            
             // Shift the bright core toward the TOP of the sprite so it sits right on the emitter.
             // (keeps particles drawn inside the tail instead of starting with a visible gap)
             let coreY = h * 0.34
@@ -1742,12 +1701,12 @@ extension CarNode {
         tex.filteringMode = .linear
         return tex
     }
-
+    
     static func makeIonExhaustEmitter(texture: SKTexture) -> SKEmitterNode {
         let e = SKEmitterNode()
         e.particleTexture = texture
         e.particleBlendMode = .add
-
+        
         // Tighter, starts right at the emitter, and fades a bit slower near the origin.
         e.particleBirthRate = 0
         e.particleLifetime = 0.42
@@ -1769,33 +1728,33 @@ extension CarNode {
         e.zPosition = 1.5
         return e
     }
-
+    
     // Ion tuning (cooler, longer, responsive to throttle)
     func updateExhaust(speed: CGFloat, fwdMag: CGFloat, dt: CGFloat) {
         let moving = speed > 2.0 || throttle > 0.02
         let speedNorm = CGFloat.clamp(speed / max(maxSpeed, 1), 0, 1)
         let throttleBoost = max(0, throttle)
         let targetMix: CGFloat = moving ? (0.35 * speedNorm + 0.65 * throttleBoost) : 0.0
-
+        
         let a = 1 - exp(-Double(dt / max(exhaustFadeTau, 0.001)))
         exhaustMixLP += (targetMix - exhaustMixLP) * CGFloat(a)
         let mix = CGFloat.clamp(exhaustMixLP, 0, 1)
-
+        
         // Keep overall length similar but ensure the plume hugs the tail at the origin.
         let maxBR: CGFloat = 400
         let br = maxBR * mix
-
+        
         let basePS: CGFloat = 150            // was 160
         let addPS:  CGFloat = 210            // was 240
         let ps = basePS + addPS * mix
-
+        
         let scale = 0.10 + 0.14 * mix        // slightly narrower
         let baseLT: CGFloat = 0.44           // a touch longer to compensate for lower speed
         let addLT:  CGFloat = 0.24
         let lt = baseLT + addLT * (mix * 0.35)
         let ltRange = lt * 0.18
         let alphaSpeed = -0.8 - 0.4 * (1 - mix) // slower fade near origin
-
+        
         [exhaustL, exhaustR].forEach { e in
             e.particleBirthRate = br
             e.particleSpeed = ps
@@ -1815,7 +1774,7 @@ extension CarNode {
         get { (objc_getAssociatedObject(self, &LandAssoc.t) as? TimeInterval) ?? 0 }
         set { objc_setAssociatedObject(self, &LandAssoc.t, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
     }
-
+    
     private struct LifeAssoc { static var max = 0, left = 0 }
     var maxLives: Int {
         get { (objc_getAssociatedObject(self, &LifeAssoc.max) as? Int) ?? 3 }
@@ -1834,20 +1793,20 @@ extension CarNode {
             onLivesChanged?(v, maxLives)
         }
     }
-
+    
     struct GhostAssoc { static var g = 0 }
-
+    
     var _airGhosting: Bool {
         get { (objc_getAssociatedObject(self, &GhostAssoc.g) as? Bool) ?? false }
         set { objc_setAssociatedObject(self, &GhostAssoc.g, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
     }
-
+    
     private struct AirAssoc {
         static var g: UInt8 = 0, z: UInt8 = 0, v: UInt8 = 0, a: UInt8 = 0
         static var m: UInt8 = 0, s: UInt8 = 0
         static var lock: UInt8 = 0
     }
-
+    
     // vertical state
     var gravity: CGFloat {
         get { objc_getAssociatedObject(self, &AirAssoc.g) as? CGFloat ?? -1800 }
@@ -1865,7 +1824,7 @@ extension CarNode {
         get { objc_getAssociatedObject(self, &AirAssoc.a) as? Bool ?? false }
         set { objc_setAssociatedObject(self, &AirAssoc.a, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
     }
-
+    
     var _groundMask: UInt32 {
         get { objc_getAssociatedObject(self, &AirAssoc.m) as? UInt32 ?? (physicsBody?.collisionBitMask ?? 0) }
         set { objc_setAssociatedObject(self, &AirAssoc.m, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
@@ -1874,17 +1833,30 @@ extension CarNode {
         get { objc_getAssociatedObject(self, &AirAssoc.s) as? SKShapeNode }
         set { objc_setAssociatedObject(self, &AirAssoc.s, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
     }
-
+    
     // hard “no-collisions” grace while jumping (prevents rim catch)
     private var _airborneLockUntil: TimeInterval {
         get { (objc_getAssociatedObject(self, &AirAssoc.lock) as? TimeInterval) ?? 0 }
         set { objc_setAssociatedObject(self, &AirAssoc.lock, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
     }
-
+    
+    func rlObservation() -> [Double] {
+        let c = self
+        let v = c.physicsBody?.velocity ?? .zero
+        let hpFrac = Double(c.hp) / Double(max(1, c.maxHP))
+        return [
+            Double(c.position.x / 1024),
+            Double(c.position.y / 1024),
+            Double(v.dx / 400),
+            Double(v.dy / 400),
+            hpFrac
+        ]
+    }
+    
     /// Call once after creation
     func enableAirPhysics() {
         _groundMask = physicsBody?.collisionBitMask ?? 0
-
+        
         let sh = SKShapeNode(ellipseOf: CGSize(width: 44, height: 18))
         sh.fillColor = .black
         sh.strokeColor = .clear
@@ -1893,20 +1865,20 @@ extension CarNode {
         addChild(sh)
         shadowNode = sh
     }
-
+    
     /// Robust vertical sim + ALWAYS-drop-off-hill assist
     func stepVertical(dt: CGFloat, groundHeight: CGFloat) {
         guard let pb = physicsBody else { return }
         let wasAir = isAirborne
         let now = CACurrentMediaTime()
-
+        
         // 1) Integrate vertical kinematics
         vz += gravity * dt
         zLift += vz * dt
-
+        
         // Clearance above terrain at the car’s XY
         let clearance = zLift - groundHeight
-
+        
         // 2) Airborne state with ramp lock
         if now < _airborneLockUntil {
             isAirborne = true
@@ -1924,27 +1896,27 @@ extension CarNode {
                 let h0 = groundHeight
                 let hx = GH(CGPoint(x: p0.x + h, y: p0.y)) - GH(CGPoint(x: p0.x - h, y: p0.y))
                 let hy = GH(CGPoint(x: p0.x, y: p0.y + h)) - GH(CGPoint(x: p0.x, y: p0.y - h))
-
+                
                 // Uphill unit (∇h); downhill is the opposite
                 var gx = hx * 0.5, gy = hy * 0.5
                 let gLen = max(1e-6, hypot(gx, gy))
                 gx /= gLen; gy /= gLen
                 let down = CGVector(dx: -gx, dy: -gy)
-
+                
                 // Sample heights a short distance outward (detects rim)
                 let d1: CGFloat = 22
                 let d2: CGFloat = 44
                 let h1 = GH(CGPoint(x: p0.x + down.dx * d1, y: p0.y + down.dy * d1))
                 let h2 = GH(CGPoint(x: p0.x + down.dx * d2, y: p0.y + down.dy * d2))
-
+                
                 // How much the ground drops just beyond the edge
                 let drop1 = h0 - h1
                 let drop2 = h1 - h2
-
+                
                 // Trigger if there is a real “edge” (two consecutive drops), AND we are not already in the air
                 // Thresholds tuned to your hill profile; safe & conservative.
                 let isEdge = (drop1 > 6 && drop2 > 6)
-
+                
                 if isEdge {
                     // Force a short airborne to pass the inner rim cleanly
                     isAirborne = true
@@ -1953,7 +1925,7 @@ extension CarNode {
                     vz = max(vz, 90)
                     // Disable ALL collisions while airborne (rim is Category.wall)
                     pb.collisionBitMask = 0
-
+                    
                     // Ensure we actually move outward even from a stop
                     let minOutSpeed: CGFloat = 160   // pt/s; small, just to clear rim
                     let vdot = pb.velocity.dx * down.dx + pb.velocity.dy * down.dy
@@ -1964,22 +1936,22 @@ extension CarNode {
                     }
                 }
             }
-
+            
             // Fallback: if we separated from ground or moving upward, become airborne
             if !isAirborne, (clearance > 3.0 || vz > 35) {
                 isAirborne = true
             }
         }
-
+        
         // 3) Clamp to terrain when grounded
         if !isAirborne && zLift < groundHeight {
             zLift = groundHeight
             if vz < 0 { vz = 0 }
         }
-
+        
         // 4) Toggle collisions by state
         pb.collisionBitMask = isAirborne ? 0 : _groundMask
-
+        
         // 5) Shadow squash by height (visual)
         if let sh = shadowNode {
             let h = max(0, zLift - groundHeight)
@@ -1987,7 +1959,7 @@ extension CarNode {
             sh.setScale(1 - 0.25 * k)
             sh.alpha = 0.25 + 0.25 * (1 - k)
         }
-
+        
         // 6) Landing energy handling
         if wasAir && !isAirborne {
             // Split velocity into car-forward / sideways
@@ -1997,10 +1969,10 @@ extension CarNode {
             let v  = pb.velocity
             let vf = v.dx * f.dx + v.dy * f.dy
             let vs = v.dx * s.dx + v.dy * s.dy
-
+            
             // Impact-scaled damping
             let impact = min(1, abs(vz) / 1100)
-
+            
             // Bias keep-forward if landing while going downhill
             var alignDown: CGFloat = 0
             if let scn = scene as? GameScene {
@@ -2013,17 +1985,17 @@ extension CarNode {
                 down.dx /= dl; down.dy /= dl
                 alignDown = max(0, f.dx * down.dx + f.dy * down.dy)
             }
-
+            
             let baseKeepF: CGFloat = 0.65 - 0.35 * impact
             let boostF:    CGFloat = 0.35 * alignDown
             let keepFwd = max(0.25, min(0.95, baseKeepF + boostF))
             let keepSide = max(0.28, 0.50 - 0.30 * impact)
-
+            
             let newVf = vf * keepFwd
             let newVs = vs * keepSide
             pb.velocity = CGVector(dx: f.dx * newVf + s.dx * newVs,
                                    dy: f.dy * newVf + s.dy * newVs)
-
+            
             // Tiny landing pop (rate-limited)
             let now2 = CACurrentMediaTime()
             if now2 - _lastLandingT > 0.08 {
@@ -2031,31 +2003,33 @@ extension CarNode {
                 run(.sequence([.scale(to: 1.03, duration: 0.05),
                                .scale(to: 1.00, duration: 0.08)]),
                     withKey: "landPop")
-                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                if kind == .player {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                }
                 _lastLandingT = now2
             }
         }
     }
-
+    
     /// `heading` is the ramp forward direction.
     /// Guarantees rim-clear at ≥ 80 km/h (with our world scale: 20 px/m → 0.18 km/h per pt/s).
     func applyRampImpulse(vzAdd: CGFloat, forwardBoost: CGFloat, heading: CGFloat) {
         guard let pb = physicsBody else { return }
-
+        
         // mark airborne + small initial lift so we don't immediately "land" on flat
         isAirborne = true
         zLift = max(zLift, 2.0)
         _airGhosting = true
         pb.collisionBitMask = 0
         speedCapBonus = 0
-
+        
         // forward basis from ramp
         let f = CGVector(dx: cos(heading), dy: sin(heading))
         let s = CGVector(dx: -f.dy,         dy: f.dx)
         let v = pb.velocity
         let vf = v.dx * f.dx + v.dy * f.dy
         let vs = v.dx * s.dx + v.dy * s.dy
-
+        
         // Apply ramp losses similar to before (slight)
         let steep = min(1.0, max(0.0, vzAdd / 1100.0))
         let loss  = min(0.60, 0.12 + 0.32 * steep)
@@ -2063,10 +2037,10 @@ extension CarNode {
         let newVs = vs * (1 - loss * 0.25)
         pb.velocity = CGVector(dx: f.dx * newVf + s.dx * newVs,
                                dy: f.dy * newVf + s.dy * newVs)
-
+        
         // give actual upward velocity
         vz += vzAdd
-
+        
         // ---- 80 km/h guarantee (world scale: 20 px/m ⇒ 0.18 km/h per pt/s) ----
         let kmhPerPtPerSec: CGFloat = 0.18          // 3.6 / 20.0
         let speedKmh = hypot(pb.velocity.dx, pb.velocity.dy) * kmhPerPtPerSec

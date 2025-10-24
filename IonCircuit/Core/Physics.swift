@@ -18,6 +18,9 @@ enum Category {
     static let bullet: UInt32       = 1 << 6
     static let enhancements: UInt32 = 1 << 7
     static let hill: UInt32         = 1 << 8
+    static let wormHead: UInt32     = 1 << 9
+    static let wormBody: UInt32     = 1 << 10
+    static let worm:    UInt32 = wormHead | wormBody
 }
 
 func shortestAngle(from a: CGFloat, to b: CGFloat) -> CGFloat {
@@ -48,6 +51,13 @@ extension CGVector {
         return CGVector(dx: dx / L, dy: dy / L)
     }
 }
+
+@inline(__always)
+private func angleLerp(from a: CGFloat, to b: CGFloat, by t: CGFloat) -> CGFloat {
+    let d = shortestAngle(from: a, to: b)
+    return a + d * t
+}
+
 
 // Convenience
 extension SKNode {

@@ -124,7 +124,7 @@ final class RampNode: SKNode {
         // Build combined transform: scale (flatten) -> shear -> translate (cast away from light)
         let S  = CGAffineTransform(scaleX: 1.0, y: scaleY)
         let Sh = CGAffineTransform(a: 1, b: 0, c: shearX, d: 1, tx: 0, ty: 0)
-        let T  = CGAffineTransform(translationX: -nx * length, y: -ny * length)
+        let T  = CGAffineTransform(translationX: nx * length, y: ny * length)
         var combined = S.concatenating(Sh).concatenating(T)
 
         guard let castPath = path.copy(using: &combined) else { return SKNode() }

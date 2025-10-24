@@ -38,14 +38,14 @@ final class GameOverOverlayNode: SKNode {
         
         title.text = "GAME OVER"
         title.fontSize = 26
-        title.fontColor = .white
+        title.fontColor = Ion.palette.text
         title.verticalAlignmentMode = .center
         title.position = CGPoint(x: 0, y: 40)
         addChild(title)
         
         hint.text = "You’re out of lives."
         hint.fontSize = 14
-        hint.fontColor = UIColor.white.withAlphaComponent(0.85)
+        hint.fontColor = Ion.palette.textDim.withAlphaComponent(0.85)
         hint.verticalAlignmentMode = .center
         hint.position = CGPoint(x: 0, y: 10)
         addChild(hint)
@@ -62,7 +62,7 @@ final class GameOverOverlayNode: SKNode {
         
         btnLabel.text = "Restart"
         btnLabel.fontSize = 16
-        btnLabel.fontColor = .white
+        btnLabel.fontColor = Ion.palette.text
         btnLabel.verticalAlignmentMode = .center
         btnLabel.position = .zero
         button.addChild(btnLabel)

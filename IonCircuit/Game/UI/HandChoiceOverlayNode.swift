@@ -55,7 +55,7 @@ final class HandChoiceOverlayNode: SKNode {
         
         title.text = "Choose hand preference"
         title.fontSize = 16
-        title.fontColor = UIColor.white.withAlphaComponent(0.95)
+        title.fontColor = Ion.palette.textDim
         title.verticalAlignmentMode = .center
         title.position = CGPoint(x: 0, y: panelRect.maxY - 44)
         addChild(title)
@@ -64,14 +64,14 @@ final class HandChoiceOverlayNode: SKNode {
             let w: CGFloat = (pw - 48) / 2
             let h: CGFloat = 56
             let btn = SKShapeNode(rectOf: CGSize(width: w, height: h), cornerRadius: 12)
-            btn.fillColor = primary ? .systemTeal : UIColor.white.withAlphaComponent(0.12)
+            btn.fillColor = primary ? Ion.palette.accentB : Ion.palette.accentB.withAlphaComponent(0.12)
             btn.strokeColor = UIColor.white.withAlphaComponent(0.20)
             btn.lineWidth = 1
             
             let label = SKLabelNode(fontNamed: "Menlo-Bold")
             label.text = text
             label.fontSize = 16
-            label.fontColor = .white
+            label.fontColor = Ion.palette.text
             label.verticalAlignmentMode = .center
             label.horizontalAlignmentMode = .center
             btn.addChild(label)
@@ -89,8 +89,8 @@ final class HandChoiceOverlayNode: SKNode {
         let rl = SKLabelNode(fontNamed: "Menlo-Bold"); rl.text = "Right"; rl.fontSize = 16; rl.verticalAlignmentMode = .center; rl.horizontalAlignmentMode = .center
         leftBtn.addChild(ll); rightBtn.addChild(rl)
         
-        leftBtn.position  = CGPoint(x: -((panel.frame.width - 48)/2 - leftBtn.frame.width/2),  y: -20)
-        rightBtn.position = CGPoint(x:  ((panel.frame.width - 48)/2 - rightBtn.frame.width/2), y: -20)
+        leftBtn.position  = CGPoint(x: -((panel.frame.width - 48)/2 + 5 - leftBtn.frame.width/2),  y: -20)
+        rightBtn.position = CGPoint(x:  ((panel.frame.width - 48)/2 + 5 - rightBtn.frame.width/2), y: -20)
         addChild(leftBtn); addChild(rightBtn)
         
         alpha = 0

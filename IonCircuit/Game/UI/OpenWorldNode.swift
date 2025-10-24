@@ -34,7 +34,7 @@ final class OpenWorldNode: SKNode {
         
         // Ground base (no stroke)
         let ground = SKShapeNode(rectOf: cfg.size, cornerRadius: 40)
-        ground.fillColor = .init(white: 0.12, alpha: 1)
+        ground.fillColor = .cyan.withAlphaComponent(0.08)
         ground.strokeColor = .clear
         addChild(ground)
         
